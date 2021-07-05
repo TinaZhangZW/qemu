@@ -983,6 +983,7 @@ static void virtio_iommu_get_config(VirtIODevice *vdev, uint8_t *config_data)
     out_config->domain_range.start = cpu_to_le32(dev_config->domain_range.start);
     out_config->domain_range.end = cpu_to_le32(dev_config->domain_range.end);
     out_config->probe_size = cpu_to_le32(dev_config->probe_size);
+    out_config->num_queues = cpu_to_le16(dev_config->num_queues);
     out_config->bypass = dev_config->bypass;
 
     trace_virtio_iommu_get_config(dev_config->page_size_mask,
@@ -991,6 +992,7 @@ static void virtio_iommu_get_config(VirtIODevice *vdev, uint8_t *config_data)
                                   dev_config->domain_range.start,
                                   dev_config->domain_range.end,
                                   dev_config->probe_size,
+                                  dev_config->num_queues,
                                   dev_config->bypass);
 }
 
@@ -1176,14 +1178,30 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOIOMMU *s = VIRTIO_IOMMU(dev);
+    VirtQueue *vq;
+    int i;
 
     virtio_init(vdev, VIRTIO_ID_IOMMU, sizeof(struct virtio_iommu_config));
 
     memset(s->iommu_pcibus_by_bus_num, 0, sizeof(s->iommu_pcibus_by_bus_num));
 
-    s->req_vq = virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE,
-                             virtio_iommu_handle_command);
-    s->event_vq = virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE, NULL);
+    if (!s->num_queues) {
+        error_setg(errp, "num-queues property must be larger than 0");
+    }
+
+    for (i = 0; i < s->num_queues; i++) {
+        virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE,
+                         virtio_iommu_handle_command);
+        /*
+         * For the moment we don't care about multiple event queues, we'll just
+         * use the first one. As events become more important with page faults
+         * we might need some efficiency there. Additional queues do need to be
+         * operational since we're advertising them to the guest.
+         */
+        vq = virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE, NULL);
+        if (!s->event_vq)
+            s->event_vq = vq;
+    }
 
     /*
      * config.bypass is needed to get initial address space early, such as
@@ -1194,6 +1212,7 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     s->config.input_range.end = UINT64_MAX;
     s->config.domain_range.end = UINT32_MAX;
     s->config.probe_size = VIOMMU_PROBE_SIZE;
+    s->config.num_queues = cpu_to_le16(s->num_queues);
 
     virtio_add_feature(&s->features, VIRTIO_RING_F_EVENT_IDX);
     virtio_add_feature(&s->features, VIRTIO_RING_F_INDIRECT_DESC);
@@ -1203,9 +1222,7 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MAP_UNMAP);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MMIO);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_PROBE);
-    if (s->bypass_feature) {
-        virtio_add_feature(&s->features, VIRTIO_IOMMU_F_BYPASS_CONFIG);
-    }
+    virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MQ);
 
     qemu_rec_mutex_init(&s->mutex);
 
@@ -1227,6 +1244,7 @@ static void virtio_iommu_device_unrealize(DeviceState *dev)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOIOMMU *s = VIRTIO_IOMMU(dev);
+    int i;
 
     qemu_unregister_reset(virtio_iommu_system_reset, s);
     qemu_remove_machine_init_done_notifier(&s->machine_done);
@@ -1241,8 +1259,9 @@ static void virtio_iommu_device_unrealize(DeviceState *dev)
 
     qemu_rec_mutex_destroy(&s->mutex);
 
-    virtio_delete_queue(s->req_vq);
-    virtio_delete_queue(s->event_vq);
+    for (i = 0; i < 2 * s->num_queues; i++) {
+        virtio_del_queue(vdev, i);
+    }
     virtio_cleanup(vdev);
 }
 
@@ -1402,6 +1421,7 @@ static Property virtio_iommu_properties[] = {
                      TYPE_PCI_BUS, PCIBus *),
     DEFINE_PROP_BOOL("boot-bypass", VirtIOIOMMU, boot_bypass, true),
     DEFINE_PROP_BOOL("bypass-feature", VirtIOIOMMU, bypass_feature, true),
+    DEFINE_PROP_UINT16("num-queues", VirtIOIOMMU, num_queues, 1),
     DEFINE_PROP_END_OF_LIST(),
 };
 
