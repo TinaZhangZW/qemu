@@ -48,7 +48,6 @@ typedef struct IOMMUPciBus {
 
 struct VirtIOIOMMU {
     VirtIODevice parent_obj;
-    VirtQueue *req_vq;
     VirtQueue *event_vq;
     struct virtio_iommu_config config;
     uint64_t features;
@@ -62,6 +61,7 @@ struct VirtIOIOMMU {
     GTree *endpoints;
     bool boot_bypass;
     bool bypass_feature;
+    uint16_t num_queues;
 };
 
 #endif
