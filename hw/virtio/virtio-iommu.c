@@ -447,14 +447,12 @@ static const PCIIOMMUOps virtio_iommu_ops = {
     .get_address_space = virtio_iommu_find_add_as,
 };
 
-static int virtio_iommu_attach(VirtIOIOMMU *s,
-                               struct virtio_iommu_req_attach *req)
+static int __virtio_iommu_attach(VirtIOIOMMU *s, uint32_t domain_id,
+                                 uint32_t ep_id, uint32_t flags,
+                                 VirtIOIOMMUDomain **out_domain)
 {
-    uint32_t domain_id = le32_to_cpu(req->domain);
-    uint32_t ep_id = le32_to_cpu(req->endpoint);
-    uint32_t flags = le32_to_cpu(req->flags);
-    VirtIOIOMMUDomain *domain;
     VirtIOIOMMUEndpoint *ep;
+    VirtIOIOMMUDomain *domain;
     IOMMUDevice *sdev;
 
     trace_virtio_iommu_attach(domain_id, ep_id);
@@ -496,7 +494,21 @@ static int virtio_iommu_attach(VirtIOIOMMU *s,
     g_tree_foreach(domain->mappings, virtio_iommu_notify_map_cb,
                    ep->iommu_mr);
 
+    *out_domain = domain;
     return VIRTIO_IOMMU_S_OK;
+}
+
+static int virtio_iommu_attach(VirtIOIOMMU *s,
+                               struct virtio_iommu_req_attach *req)
+{
+    uint32_t domain_id = le32_to_cpu(req->domain);
+    uint32_t ep_id = le32_to_cpu(req->endpoint);
+    uint32_t flags = le32_to_cpu(req->flags);
+    VirtIOIOMMUDomain *domain;
+
+    trace_virtio_iommu_attach(domain_id, ep_id);
+
+    return __virtio_iommu_attach(s, domain_id, ep_id, flags, &domain);
 }
 
 static int virtio_iommu_detach(VirtIOIOMMU *s,
@@ -843,23 +855,64 @@ static void virtio_iommu_report_fault(VirtIOIOMMU *viommu, uint8_t reason,
 
 }
 
+static int virtio_iommu_lookup_mapping(VirtIOIOMMU *s, uint32_t sid,
+                                       VirtIOIOMMUDomain *domain, hwaddr addr,
+                                       IOMMUAccessFlags flag,
+                                       IOMMUTLBEntry *entry)
+{
+    bool found;
+    uint32_t flags;
+    bool read_fault, write_fault;
+    VirtIOIOMMUMapping *mapping_value;
+    VirtIOIOMMUInterval interval, *mapping_key;
+
+    interval.low = addr;
+    interval.high = addr + 1;
+
+    found = g_tree_lookup_extended(domain->mappings, (gpointer)(&interval),
+                                   (void **)&mapping_key,
+                                   (void **)&mapping_value);
+    if (!found) {
+        error_report_once("%s no mapping for 0x%"PRIx64" for sid=%d",
+                          __func__, addr, sid);
+        virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
+                                  VIRTIO_IOMMU_FAULT_F_ADDRESS,
+                                  sid, addr);
+        return ENOENT;
+    }
+
+    read_fault = (flag & IOMMU_RO) &&
+                    !(mapping_value->flags & VIRTIO_IOMMU_MAP_F_READ);
+    write_fault = (flag & IOMMU_WO) &&
+                    !(mapping_value->flags & VIRTIO_IOMMU_MAP_F_WRITE);
+
+    flags = read_fault ? VIRTIO_IOMMU_FAULT_F_READ : 0;
+    flags |= write_fault ? VIRTIO_IOMMU_FAULT_F_WRITE : 0;
+    if (flags) {
+        error_report_once("%s permission error on 0x%"PRIx64"(%d): allowed=%d",
+                          __func__, addr, flag, mapping_value->flags);
+        flags |= VIRTIO_IOMMU_FAULT_F_ADDRESS;
+        virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
+                                  flags | VIRTIO_IOMMU_FAULT_F_ADDRESS,
+                                  sid, addr);
+        return EFAULT;
+    }
+    entry->translated_addr = addr - mapping_key->low + mapping_value->phys_addr;
+    entry->perm = flag;
+    trace_virtio_iommu_translate_out(addr, entry->translated_addr, sid);
+    return 0;
+}
+
 static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
                                             IOMMUAccessFlags flag,
                                             int iommu_idx)
 {
     IOMMUDevice *sdev = container_of(mr, IOMMUDevice, iommu_mr);
-    VirtIOIOMMUInterval interval, *mapping_key;
-    VirtIOIOMMUMapping *mapping_value;
     VirtIOIOMMU *s = sdev->viommu;
-    bool read_fault, write_fault;
     VirtIOIOMMUEndpoint *ep;
-    uint32_t sid, flags;
     bool bypass_allowed;
-    bool found;
+    uint32_t sid;
     int i;
-
-    interval.low = addr;
-    interval.high = addr + 1;
 
     IOMMUTLBEntry entry = {
         .target_as = &address_space_memory,
@@ -929,37 +982,7 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         goto unlock;
     }
 
-    found = g_tree_lookup_extended(ep->domain->mappings, (gpointer)(&interval),
-                                   (void **)&mapping_key,
-                                   (void **)&mapping_value);
-    if (!found) {
-        error_report_once("%s no mapping for 0x%"PRIx64" for sid=%d",
-                          __func__, addr, sid);
-        virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
-                                  VIRTIO_IOMMU_FAULT_F_ADDRESS,
-                                  sid, addr);
-        goto unlock;
-    }
-
-    read_fault = (flag & IOMMU_RO) &&
-                    !(mapping_value->flags & VIRTIO_IOMMU_MAP_F_READ);
-    write_fault = (flag & IOMMU_WO) &&
-                    !(mapping_value->flags & VIRTIO_IOMMU_MAP_F_WRITE);
-
-    flags = read_fault ? VIRTIO_IOMMU_FAULT_F_READ : 0;
-    flags |= write_fault ? VIRTIO_IOMMU_FAULT_F_WRITE : 0;
-    if (flags) {
-        error_report_once("%s permission error on 0x%"PRIx64"(%d): allowed=%d",
-                          __func__, addr, flag, mapping_value->flags);
-        flags |= VIRTIO_IOMMU_FAULT_F_ADDRESS;
-        virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
-                                  flags | VIRTIO_IOMMU_FAULT_F_ADDRESS,
-                                  sid, addr);
-        goto unlock;
-    }
-    entry.translated_addr = addr - mapping_key->low + mapping_value->phys_addr;
-    entry.perm = flag;
-    trace_virtio_iommu_translate_out(addr, entry.translated_addr, sid);
+    virtio_iommu_lookup_mapping(s, sid, ep->domain, addr, flag, &entry);
 
 unlock:
     qemu_rec_mutex_unlock(&s->mutex);
