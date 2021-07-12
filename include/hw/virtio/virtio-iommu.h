@@ -64,6 +64,7 @@ struct VirtIOIOMMU {
     Notifier machine_done;
     bool granule_frozen;
     uint16_t num_queues;
+    bool page_tables;
 };
 
 #endif
