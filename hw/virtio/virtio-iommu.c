@@ -36,6 +36,40 @@
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci.h"
 
+
+#define VIRT_PGTABLE_SIZE               0x1000
+#define VIRT_PGTABLE_PTE_SIZE           8
+#define VIRT_PGTABLE_NUM_PTES           \
+    (VIRT_PGTABLE_SIZE / VIRT_PGTABLE_PTE_SIZE)
+#define VIRT_PGTABLE_BITS_PER_LEVEL     9
+
+#define VIRT_PGTABLE_VA_BITS            48
+#define VIRT_PGTABLE_PA_BITS            52
+#define VIRT_PGTABLE_GRANULE_SHIFT      12
+#define VIRT_PGTABLE_GRANULE            (1 << VIRT_PGTABLE_GRANULE_SHIFT)
+#define VIRT_PGTABLE_LAST_LEVEL         \
+    (((VIRT_PGTABLE_VA_BITS - VIRT_PGTABLE_GRANULE_SHIFT) / \
+      VIRT_PGTABLE_BITS_PER_LEVEL) - 1)
+
+#define VIRT_PGTABLE_IDX_MASK           ((1 << VIRT_PGTABLE_BITS_PER_LEVEL) - 1)
+#define VIRT_PGTABLE_IDX_SHIFT(lvl)     \
+    ((VIRT_PGTABLE_LAST_LEVEL - (lvl)) * VIRT_PGTABLE_BITS_PER_LEVEL + \
+     VIRT_PGTABLE_GRANULE_SHIFT)
+#define VIRT_PGTABLE_IDX(iova, lvl) \
+        (((iova) >> VIRT_PGTABLE_IDX_SHIFT(lvl)) & VIRT_PGTABLE_IDX_MASK)
+
+
+#define VIRT_PGTABLE_PTE_VALID          (1ULL << 0)
+#define VIRT_PGTABLE_PTE_TABLE          (1ULL << 1)
+#define VIRT_PGTABLE_PTE_READ           (1ULL << 2)
+#define VIRT_PGTABLE_PTE_WRITE          (1ULL << 3)
+#define VIRT_PGTABLE_PTE_PFN_MASK(lvl)  \
+    ((~0ULL << VIRT_PGTABLE_IDX_SHIFT(lvl)) & ((1ULL << VIRT_PGTABLE_PA_BITS) - 1))
+#define VIRT_PGTABLE_PTE_ACCESS         (1ULL << 52)
+#define VIRT_PGTABLE_PTE_DIRTY          (1ULL << 53)
+#define VIRT_PGTABLE_PTE_FLOAT          (1ULL << 54)
+
+
 /* Max size */
 #define VIOMMU_DEFAULT_QUEUE_SIZE 256
 #define VIOMMU_PROBE_SIZE 512
@@ -45,6 +79,7 @@ typedef struct VirtIOIOMMUDomain {
     bool bypass;
     GTree *mappings;
     QLIST_HEAD(, VirtIOIOMMUEndpoint) endpoint_list;
+    uint64_t pgd;
 } VirtIOIOMMUDomain;
 
 typedef struct VirtIOIOMMUEndpoint {
@@ -511,6 +546,36 @@ static int virtio_iommu_attach(VirtIOIOMMU *s,
     return __virtio_iommu_attach(s, domain_id, ep_id, flags, &domain);
 }
 
+static int virtio_iommu_attach_table(VirtIOIOMMU *s,
+                                     struct virtio_iommu_req_attach_table *req)
+{
+    uint32_t domain_id = le32_to_cpu(req->domain);
+    uint32_t ep_id = le32_to_cpu(req->endpoint);
+    uint32_t flags = le32_to_cpu(req->flags);
+    VirtIOIOMMUDomain *domain;
+    uint16_t format;
+    int status;
+
+    status = __virtio_iommu_attach(s, domain_id, ep_id, flags, &domain);
+    if (status != VIRTIO_IOMMU_S_OK) {
+        return status;
+    }
+
+    format = le16_to_cpu(req->format);
+    switch (format) {
+    case VIRTIO_IOMMU_FORMAT_PGTF_VIRT: {
+        struct virtio_iommu_req_attach_pgt_virt *vreq = (void *)req;
+
+        domain->pgd = le64_to_cpu(vreq->pgd);
+        }
+        break;
+    default:
+        return VIRTIO_IOMMU_S_INVAL;
+    }
+
+    return VIRTIO_IOMMU_S_OK;
+}
+
 static int virtio_iommu_detach(VirtIOIOMMU *s,
                                struct virtio_iommu_req_detach *req)
 {
@@ -639,6 +704,68 @@ static int virtio_iommu_unmap(VirtIOIOMMU *s,
     return ret;
 }
 
+static int virtio_iommu_invalidate(VirtIOIOMMU *s,
+                                   struct virtio_iommu_req_invalidate *req)
+{
+    VirtIOIOMMUEndpoint *ep;
+    VirtIOIOMMUDomain *domain;
+    int ret = VIRTIO_IOMMU_S_OK;
+    hwaddr start_addr, end_addr, nr_pages;
+    uint32_t domain_id = le32_to_cpu(req->domain);
+
+    domain = g_tree_lookup(s->domains, GUINT_TO_POINTER(domain_id));
+    if (!domain) {
+        return VIRTIO_IOMMU_S_NOENT;
+    }
+
+    /*
+     * We don't have an internal TLB at the moment.
+     * Synchronization against concurrent page walks is done by the viommu
+     * mutex.
+     *
+     * First ask clients that are holding onto TLB entry to release them.
+     * FIXME: which order?
+     */
+
+    if (le32_to_cpu(req->inv_type) != VIRTIO_IOMMU_INV_T_IOTLB) {
+        /* FIXME: these are flags */
+        error_report_once("Unhandled invalidate");
+        return VIRTIO_IOMMU_S_UNSUPP;
+    }
+
+    switch (le32_to_cpu(req->inv_gran)) {
+    case VIRTIO_IOMMU_INVAL_G_DOMAIN:
+    case VIRTIO_IOMMU_INVAL_G_PASID:
+        start_addr = 0;
+        end_addr = ~0UL;
+        trace_virtio_iommu_inval_domain(domain_id);
+        break;
+    case VIRTIO_IOMMU_INVAL_G_VA:
+        start_addr = le64_to_cpu(req->virt_start);
+        nr_pages = le64_to_cpu(req->nr_pages);
+        end_addr = start_addr + nr_pages * (1 << req->granule) - 1;
+        trace_virtio_iommu_inval_range(domain_id, start_addr, end_addr);
+        break;
+    default:
+        return VIRTIO_IOMMU_S_INVAL;
+    }
+
+    QLIST_FOREACH(ep, &domain->endpoint_list, next) {
+        virtio_iommu_notify_unmap(ep->iommu_mr, start_addr, end_addr);
+    }
+
+    /*
+     * Synchronize against concurrent users of the mapping
+     * FIXME: ... Unfortunately we can't do that, because on TCG everything
+     * is within a RCU read section. cpu_exec takes the read lock and holds
+     * on to it.
+     */
+    ///synchronize_rcu();
+
+    trace_virtio_iommu_inval_done(domain_id);
+    return ret;
+}
+
 static ssize_t virtio_iommu_fill_resv_mem_prop(VirtIOIOMMU *s, uint32_t ep,
                                                uint8_t *buf, size_t free)
 {
@@ -672,6 +799,51 @@ static ssize_t virtio_iommu_fill_resv_mem_prop(VirtIOIOMMU *s, uint32_t ep,
     return total;
 }
 
+static ssize_t virtio_iommu_fill_virt_table_prop(VirtIOIOMMU *s, uint32_t ep,
+                                                 uint8_t *buf, size_t free)
+{
+    size_t size;
+    size_t head_sz = sizeof(struct virtio_iommu_probe_property);
+
+    struct {
+        struct virtio_iommu_probe_page_size_mask pgsize;
+        struct virtio_iommu_probe_input_range input;
+        struct virtio_iommu_probe_output_size output;
+        struct virtio_iommu_probe_table_format table;
+    } props = {
+        .pgsize = {
+            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK),
+            .head.length = cpu_to_le16(sizeof(props.pgsize) - head_sz),
+            .mask = cpu_to_le64(0x40201000),
+        },
+        .input = {
+            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_INPUT_RANGE),
+            .head.length = cpu_to_le16(sizeof(props.input) - head_sz),
+            .start = 0,
+            .end = cpu_to_le64((1ULL << VIRT_PGTABLE_VA_BITS) - 1),
+        },
+        .output = {
+            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_OUTPUT_SIZE),
+            .head.length = cpu_to_le16(sizeof(props.output) - head_sz),
+            .bits = VIRT_PGTABLE_PA_BITS,
+        },
+        .table = {
+            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_TABLE_FMT),
+            .head.length = cpu_to_le16(sizeof(props.table) - head_sz),
+            .format = cpu_to_le16(VIRTIO_IOMMU_FORMAT_PGTF_VIRT),
+        },
+    };
+
+    size = sizeof(props);
+    if (size > free) {
+        return -ENOSPC;
+    }
+
+    memcpy(buf, &props, size);
+
+    return size;
+}
+
 /**
  * virtio_iommu_probe - Fill the probe request buffer with
  * the properties the device is able to return
@@ -689,6 +861,18 @@ static int virtio_iommu_probe(VirtIOIOMMU *s,
     }
 
     count = virtio_iommu_fill_resv_mem_prop(s, ep_id, buf, free);
+    if (count < 0) {
+        return VIRTIO_IOMMU_S_INVAL;
+    }
+    buf += count;
+    free -= count;
+
+    if (!s->page_tables) {
+        return VIRTIO_IOMMU_S_OK;
+    }
+
+    /* TODO: distinguish virtual from physical devices */
+    count = virtio_iommu_fill_virt_table_prop(s, ep_id, buf, free);
     if (count < 0) {
         return VIRTIO_IOMMU_S_INVAL;
     }
@@ -723,9 +907,11 @@ static int virtio_iommu_handle_ ## __req(VirtIOIOMMU *s,                \
 }
 
 virtio_iommu_handle_req(attach)
+virtio_iommu_handle_req(attach_table)
 virtio_iommu_handle_req(detach)
 virtio_iommu_handle_req(map)
 virtio_iommu_handle_req(unmap)
+virtio_iommu_handle_req(invalidate)
 
 static int virtio_iommu_handle_probe(VirtIOIOMMU *s,
                                      struct iovec *iov,
@@ -774,6 +960,12 @@ static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
         switch (head.type) {
         case VIRTIO_IOMMU_T_ATTACH:
             tail.status = virtio_iommu_handle_attach(s, iov, iov_cnt);
+            break;
+        case VIRTIO_IOMMU_T_ATTACH_TABLE:
+            tail.status = virtio_iommu_handle_attach_table(s, iov, iov_cnt);
+            break;
+        case VIRTIO_IOMMU_T_INVALIDATE:
+            tail.status = virtio_iommu_handle_invalidate(s, iov, iov_cnt);
             break;
         case VIRTIO_IOMMU_T_DETACH:
             tail.status = virtio_iommu_handle_detach(s, iov, iov_cnt);
@@ -903,6 +1095,80 @@ static int virtio_iommu_lookup_mapping(VirtIOIOMMU *s, uint32_t sid,
     return 0;
 }
 
+static int virtio_iommu_walk_page_table(VirtIOIOMMU *s, uint32_t sid,
+                                       VirtIOIOMMUDomain *domain, hwaddr addr,
+                                       IOMMUAccessFlags flag,
+                                       IOMMUTLBEntry *entry)
+{
+    int ret;
+    int lvl, idx;
+    uint64_t pte;
+    uint64_t mask;
+    uint32_t flags;
+    bool read_fault, write_fault;
+    uint64_t pte_address = domain->pgd;
+
+    /* Pair with the smp_wmb() in the guest page table driver */
+    smp_rmb();
+
+    for (lvl = 0; lvl <= VIRT_PGTABLE_LAST_LEVEL; lvl++) {
+        idx = VIRT_PGTABLE_IDX(addr, lvl);
+        assert(idx >= 0 && idx < VIRT_PGTABLE_NUM_PTES);
+
+        pte_address += idx * 8;
+
+        ret = dma_memory_read_relaxed(&address_space_memory, pte_address, &pte,
+                                      sizeof(pte));
+        if (ret != MEMTX_OK) {
+            error_report_once("%s walk error on 0x%"PRIx64, __func__, addr);
+            virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_UNKNOWN,
+                                      VIRTIO_IOMMU_FAULT_F_ADDRESS, sid, addr);
+            return EFAULT;
+        }
+
+        if (!(pte & VIRT_PGTABLE_PTE_VALID)) {
+            error_report_once("%s translation fault on 0x%"PRIx64, __func__, addr);
+            virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
+                                      VIRTIO_IOMMU_FAULT_F_ADDRESS, sid, addr);
+            return EFAULT;
+        }
+
+        if (!(pte & VIRT_PGTABLE_PTE_TABLE)) {
+            /* We've reached the leaf. Check permissions. */
+            read_fault = (flag & IOMMU_RO) && !(pte & VIRT_PGTABLE_PTE_READ);
+            write_fault = (flag & IOMMU_WO) && !(pte & VIRT_PGTABLE_PTE_WRITE);
+            flags = read_fault ? VIRTIO_IOMMU_FAULT_F_READ : 0;
+            flags |= write_fault ? VIRTIO_IOMMU_FAULT_F_WRITE : 0;
+            if (flags) {
+                error_report_once("%s permission error on 0x%"PRIx64"(%d): pte=0x%"PRIx64,
+                                  __func__, addr, flag, pte);
+                flags |= VIRTIO_IOMMU_FAULT_F_ADDRESS;
+                virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_MAPPING,
+                                          flags | VIRTIO_IOMMU_FAULT_F_ADDRESS,
+                                          sid, addr);
+                return EFAULT;
+            }
+
+            mask = (1ULL << VIRT_PGTABLE_IDX_SHIFT(lvl)) - 1;
+            entry->translated_addr = (pte & VIRT_PGTABLE_PTE_PFN_MASK(lvl)) |
+                                     (addr & mask);
+            entry->addr_mask = mask;
+            entry->perm = flag;
+            trace_virtio_iommu_translate_out(addr, entry->translated_addr, sid);
+            return 0;
+        }
+
+        /* Next table */
+        pte_address = pte & VIRT_PGTABLE_PTE_PFN_MASK(VIRT_PGTABLE_LAST_LEVEL);
+    }
+
+    /* Getting here means the last level entry was a table pointer. */
+    error_report_once("%s invalid PTE for 0x%"PRIx64, __func__, addr);
+    virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_UNKNOWN,
+                              VIRTIO_IOMMU_FAULT_F_ADDRESS, sid, addr);
+    return EFAULT;
+}
+
 static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
                                             IOMMUAccessFlags flag,
                                             int iommu_idx)
@@ -982,7 +1248,11 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         goto unlock;
     }
 
-    virtio_iommu_lookup_mapping(s, sid, ep->domain, addr, flag, &entry);
+    if (ep->domain->pgd) {
+        virtio_iommu_walk_page_table(s, sid, ep->domain, addr, flag, &entry);
+    } else {
+        virtio_iommu_lookup_mapping(s, sid, ep->domain, addr, flag, &entry);
+    }
 
 unlock:
     qemu_rec_mutex_unlock(&s->mutex);
@@ -1223,6 +1493,9 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MMIO);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_PROBE);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MQ);
+    if (s->page_tables) {
+        virtio_add_feature(&s->features, VIRTIO_IOMMU_F_ATTACH_TABLE);
+    }
 
     qemu_rec_mutex_init(&s->mutex);
 
@@ -1417,6 +1690,7 @@ static Property virtio_iommu_properties[] = {
     DEFINE_PROP_BOOL("boot-bypass", VirtIOIOMMU, boot_bypass, true),
     DEFINE_PROP_BOOL("bypass-feature", VirtIOIOMMU, bypass_feature, true),
     DEFINE_PROP_UINT16("num-queues", VirtIOIOMMU, num_queues, 1),
+    DEFINE_PROP_BOOL("page-tables", VirtIOIOMMU, page_tables, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

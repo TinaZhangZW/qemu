@@ -62,6 +62,7 @@ struct VirtIOIOMMU {
     bool boot_bypass;
     bool bypass_feature;
     uint16_t num_queues;
+    bool page_tables;
 };
 
 #endif
