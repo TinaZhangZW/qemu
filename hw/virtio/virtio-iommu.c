@@ -492,7 +492,7 @@ static int __virtio_iommu_attach(VirtIOIOMMU *s, uint32_t domain_id,
 
     trace_virtio_iommu_attach(domain_id, ep_id);
 
-    if (flags & ~VIRTIO_IOMMU_ATTACH_F_BYPASS) {
+    if (flags & ~(VIRTIO_IOMMU_ATTACH_F_BYPASS | VIRTIO_IOMMU_ATTACH_F_POSTED)) {
         return VIRTIO_IOMMU_S_INVAL;
     }
 
@@ -924,7 +924,7 @@ static int virtio_iommu_handle_probe(VirtIOIOMMU *s,
     return ret ? ret : virtio_iommu_probe(s, &req, buf);
 }
 
-static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
+static void virtio_iommu_handle_command_from(VirtIODevice *vdev, VirtQueue *vq, const char *from)
 {
     VirtIOIOMMU *s = VIRTIO_IOMMU(vdev);
     struct virtio_iommu_req_head head;
@@ -934,11 +934,12 @@ static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
     unsigned int iov_cnt;
     struct iovec *iov;
     void *buf = NULL;
+    int i = 0;
 
-    for (;;) {
+    for (;; i++) {
         elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
         if (!elem) {
-            return;
+            break;
         }
 
         if (iov_size(elem->in_sg, elem->in_num) < sizeof(tail) ||
@@ -1003,6 +1004,13 @@ out:
         g_free(buf);
         buf = NULL;
     }
+
+    trace_virtio_iommu_handle(from, i);
+}
+
+static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
+{
+    virtio_iommu_handle_command_from(vdev, vq, "vq");
 }
 
 static void virtio_iommu_report_fault(VirtIOIOMMU *viommu, uint8_t reason,
@@ -1187,6 +1195,42 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         .addr_mask = (1 << ctz32(s->config.page_size_mask)) - 1,
         .perm = IOMMU_NONE,
     };
+
+    if (s->posted_map) {
+        /*
+         * So the context is not great because we're at the far end of a memory
+         * access, holding the RCU read lock. But then again TCG holds the read
+         * lock pretty much constantly while executing, which means
+         * handle_command() has to work in that context. Let's try it.
+         *
+         * The flow is
+         *            host                            guest
+         *  (1) add map request
+         *  (2) submit DMA job    -------->       execute job
+         *                                        translate DMA address
+         *                                        handle map request
+         *                                        execute DMA
+         *                        <--------       complete job
+         *      add unmap request
+         *      sync              -------->       handle unmap request
+         *                        <--------
+         *      complete map and
+         *       unmap requests
+         *
+         * Host and guest could execute on different CPUs so the arrow at (2)
+         * isn't necessarily a context switch. Since we don't sync() between (1)
+         * and (2), there needs to be at least a write barrier between (1) and
+         * (2), which pairs with this smb_rmb().
+         */
+        smp_rmb();
+        for (i = 0; i < s->num_queues; i++) {
+            if (virtio_queue_empty(s->req_vq[i])) {
+                continue;
+            }
+            virtio_iommu_handle_command_from(VIRTIO_DEVICE(s), s->req_vq[i],
+                                             "translate");
+        }
+    }
 
     bypass_allowed = s->config.bypass;
 
@@ -1459,9 +1503,10 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "num-queues property must be larger than 0");
     }
 
+    s->req_vq = g_malloc0_n(s->num_queues, sizeof(*s->req_vq));
     for (i = 0; i < s->num_queues; i++) {
-        virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE,
-                         virtio_iommu_handle_command);
+        s->req_vq[i] = virtio_add_queue(vdev, VIOMMU_DEFAULT_QUEUE_SIZE,
+                                        virtio_iommu_handle_command);
         /*
          * For the moment we don't care about multiple event queues, we'll just
          * use the first one. As events become more important with page faults
@@ -1495,6 +1540,9 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MQ);
     if (s->page_tables) {
         virtio_add_feature(&s->features, VIRTIO_IOMMU_F_ATTACH_TABLE);
+    }
+    if (s->posted_map) {
+        virtio_add_feature(&s->features, VIRTIO_IOMMU_F_POSTED_MAP);
     }
 
     qemu_rec_mutex_init(&s->mutex);
@@ -1691,6 +1739,7 @@ static Property virtio_iommu_properties[] = {
     DEFINE_PROP_BOOL("bypass-feature", VirtIOIOMMU, bypass_feature, true),
     DEFINE_PROP_UINT16("num-queues", VirtIOIOMMU, num_queues, 1),
     DEFINE_PROP_BOOL("page-tables", VirtIOIOMMU, page_tables, false),
+    DEFINE_PROP_BOOL("posted-map", VirtIOIOMMU, posted_map, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 

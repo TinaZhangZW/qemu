@@ -49,6 +49,8 @@ typedef struct IOMMUPciBus {
 struct VirtIOIOMMU {
     VirtIODevice parent_obj;
     VirtQueue *event_vq;
+    /* Array of num_queues pointers */
+    VirtQueue **req_vq;
     struct virtio_iommu_config config;
     uint64_t features;
     GHashTable *as_by_busptr;
@@ -63,6 +65,7 @@ struct VirtIOIOMMU {
     bool bypass_feature;
     uint16_t num_queues;
     bool page_tables;
+    bool posted_map;
 };
 
 #endif
