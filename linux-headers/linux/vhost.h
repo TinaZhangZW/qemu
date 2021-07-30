@@ -14,6 +14,7 @@
 #include <linux/vhost_types.h>
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#include <linux/virtio_iommu.h>
 
 #define VHOST_FILE_UNBIND -1
 
@@ -179,5 +180,15 @@
  * configuration after that point.
  */
 #define VHOST_VDPA_SUSPEND		_IO(VHOST_VIRTIO, 0x7D)
+
+/*
+ * Add, modify, remove an endpoint managed by the vhost-iommu
+ */
+#define VHOST_IOMMU_REGISTER_ENDPOINT	_IOW(VHOST_VIRTIO, 0x90, \
+					     struct vhost_iommu_register_endpoint)
+/* Device reset removes all domains and mappings */
+#define VHOST_IOMMU_SET_STATUS		_IOW(VHOST_VIRTIO, 0x91, __u8)
+#define VHOST_IOMMU_XLATE		_IOWR(VHOST_VIRTIO, 0x93, \
+					      struct vhost_iommu_xlate)
 
 #endif
