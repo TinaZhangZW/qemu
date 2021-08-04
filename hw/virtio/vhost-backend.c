@@ -20,6 +20,15 @@
 #include <linux/vhost.h>
 #include <sys/ioctl.h>
 
+struct vhost_iommu_endpoint {
+    struct vhost_iommu_register_endpoint cfg;
+    uint32_t vhost_iommu_fd;
+    AddressSpace *as;
+    QLIST_ENTRY(vhost_iommu_endpoint) next;
+};
+static QLIST_HEAD(, vhost_iommu_endpoint) vhost_iommu_endpoints =
+    QLIST_HEAD_INITIALIZER(vhost_iommu_endpoints);
+
 static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
                              void *arg)
 {
@@ -287,6 +296,55 @@ static int vhost_kernel_send_device_iotlb_msg(struct vhost_dev *dev,
     return 0;
 }
 
+static int vhost_kernel_iommu_register_ioctl(int vhost_iommu_fd,
+                                     struct vhost_iommu_register_endpoint *cfg)
+{
+    int ret;
+
+    ret = ioctl(vhost_iommu_fd, VHOST_IOMMU_REGISTER_ENDPOINT, cfg);
+    if (ret) {
+        /*
+         * If we fail to register, then the vhost device will fall back to
+         * vhost-iotlb. Even slower than vhost-iotlb because translate()
+         * needs to query vhost-iommu!
+         */
+        error_report("VHOST_IOMMU_REGISTER_ENDPOINT failed with %d: %s\n", ret,
+                     strerror(errno));
+    }
+    return ret;
+}
+
+static void vhost_kernel_set_vhost_iommu_fd(struct vhost_dev *dev, int enabled)
+{
+    struct vhost_iommu_endpoint *ep;
+    struct vhost_iommu_register_endpoint cfg;
+    AddressSpace *as = dev->vdev->dma_as;
+
+    /*
+     * Find the matching address space. I hope to figure out a correct way to
+     * get the endpoint ID and vhost-iommu fd from the vhost_dev, but for now
+     * this dirty hack will have to do.
+     */
+    QLIST_FOREACH(ep, &vhost_iommu_endpoints, next) {
+        if (as != ep->as) {
+            continue;
+        }
+
+        cfg = ep->cfg; /* copy */
+        cfg.flags = enabled ? VHOST_IOMMU_ADD_FD : VHOST_IOMMU_DEL_FD;
+        cfg.fd = (uintptr_t)dev->opaque;
+
+        if (!vhost_kernel_iommu_register_ioctl(ep->vhost_iommu_fd, &cfg)) {
+            printf("%s: Successfully %s vhost endpoint\n", __func__,
+                   enabled ? "attached" : "detached");
+        }
+        return;
+    }
+
+    error_report("%s: Didn't find a matching memory region for vhost device\n",
+                 __func__);
+}
+
 static void vhost_kernel_set_iotlb_callback(struct vhost_dev *dev,
                                            int enabled)
 {
@@ -295,6 +353,43 @@ static void vhost_kernel_set_iotlb_callback(struct vhost_dev *dev,
                             vhost_kernel_iotlb_read, NULL, dev);
     else
         qemu_set_fd_handler((uintptr_t)dev->opaque, NULL, NULL, NULL);
+
+    /* register the vhost fd to vhost-iommu, if applicable */
+    vhost_kernel_set_vhost_iommu_fd(dev, enabled);
+}
+
+static int vhost_kernel_iommu_set_endpoint(struct vhost_dev *dev,
+                                   AddressSpace *as,
+                                   struct vhost_iommu_register_endpoint *cfg)
+{
+    int iommu_fd = (uintptr_t)dev->opaque;
+    struct vhost_iommu_endpoint *ep;
+    int ret;
+
+    /*
+     * First the normal thing, perform an ioctl with the configuration.
+     */
+    ret = vhost_kernel_iommu_register_ioctl(iommu_fd, cfg);
+    if (ret) {
+        return ret;
+    }
+
+    if (cfg->flags & VHOST_IOMMU_UNREGISTER_ENDPOINT) {
+        /* TODO: remove from list? */
+        return 0;
+    }
+    /*
+     * Then the twisted part. We don't have the endpoint fd at the moment, so
+     * we'll let set_iotlb_callback() re-run the ioctl.
+     */
+    ep = g_malloc0(sizeof(*ep));
+    ep->vhost_iommu_fd = iommu_fd;
+    ep->cfg = *cfg;
+    ep->as = as;
+
+    /* FIXME: lock? */
+    QLIST_INSERT_HEAD(&vhost_iommu_endpoints, ep, next);
+    return 0;
 }
 
 const VhostOps kernel_ops = {
@@ -328,6 +423,8 @@ const VhostOps kernel_ops = {
         .vhost_vsock_set_running = vhost_kernel_vsock_set_running,
         .vhost_set_iotlb_callback = vhost_kernel_set_iotlb_callback,
         .vhost_send_device_iotlb_msg = vhost_kernel_send_device_iotlb_msg,
+        .vhost_iommu_set_endpoint = vhost_kernel_iommu_set_endpoint,
+//        .vhost_iommu_xlate = vhost_kernel_iommu_xlate,
 };
 #endif
 

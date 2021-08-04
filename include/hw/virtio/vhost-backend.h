@@ -36,6 +36,7 @@ struct vhost_vring_addr;
 struct vhost_scsi_target;
 struct vhost_iotlb_msg;
 struct vhost_virtqueue;
+struct vhost_iommu_register_endpoint;
 
 typedef int (*vhost_backend_init)(struct vhost_dev *dev, void *opaque,
                                   Error **errp);
@@ -130,6 +131,10 @@ typedef bool (*vhost_force_iommu_op)(struct vhost_dev *dev);
 
 typedef int (*vhost_set_config_call_op)(struct vhost_dev *dev,
                                        int fd);
+typedef int (*vhost_iommu_set_endpoint_op)(struct vhost_dev *dev,
+                                          AddressSpace *as,
+					   struct vhost_iommu_register_endpoint *cfg);
+
 typedef struct VhostOps {
     VhostBackendType backend_type;
     vhost_backend_init vhost_backend_init;
@@ -177,6 +182,7 @@ typedef struct VhostOps {
     vhost_get_device_id_op vhost_get_device_id;
     vhost_force_iommu_op vhost_force_iommu;
     vhost_set_config_call_op vhost_set_config_call;
+    vhost_iommu_set_endpoint_op vhost_iommu_set_endpoint;
 } VhostOps;
 
 int vhost_backend_update_device_iotlb(struct vhost_dev *dev,
