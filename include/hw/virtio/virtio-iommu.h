@@ -22,6 +22,7 @@
 
 #include "standard-headers/linux/virtio_iommu.h"
 #include "hw/virtio/virtio.h"
+#include "hw/virtio/vhost.h"
 #include "hw/pci/pci.h"
 #include "qom/object.h"
 
@@ -61,6 +62,14 @@ typedef struct IOMMUPciBus {
     IOMMUDevice  *pbdev[]; /* Parent array is sparse, so dynamically alloc */
 } IOMMUPciBus;
 
+struct vhost_iommu_ {
+    struct vhost_dev dev;
+    struct vhost_virtqueue *vqs;
+    uint8_t *probe_buffer;
+    int fd;
+    bool started;
+};
+
 struct VirtIOIOMMU {
     VirtIODevice parent_obj;
     VirtQueue *event_vq;
@@ -84,6 +93,8 @@ struct VirtIOIOMMU {
     void *hw_info;
     GTree *pasid_ass;       /* PASIDAddressSpace instances */
     Hwpt *s2_hwpt;
+    bool use_vhost;
+    struct vhost_iommu_ *vhost_iommu;
 };
 
 #endif

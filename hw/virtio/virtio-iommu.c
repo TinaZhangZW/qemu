@@ -34,9 +34,14 @@
 #include "hw/virtio/virtio-access.h"
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/pci/pci_device.h"
 #include "hw/pci/pci.h"
 
 #include "sysemu/iommufd.h"
+
+#include <linux/vhost.h>
+#include <sys/ioctl.h>
+#include "hw/virtio/vhost.h"
 
 #define VIRT_PGTABLE_SIZE               0x1000
 #define VIRT_PGTABLE_PTE_SIZE           8
@@ -106,6 +111,16 @@ typedef struct VirtIOIOMMUHWInfo {
     } data;
 } VirtIOIOMMUHWInfo;
 
+static const int vhost_iommu_feature_bits[] = {
+    VIRTIO_RING_F_INDIRECT_DESC,
+    VIRTIO_RING_F_EVENT_IDX,
+    VIRTIO_F_VERSION_1,
+    VIRTIO_IOMMU_F_INPUT_RANGE,
+    VIRTIO_IOMMU_F_DOMAIN_RANGE,
+    VIRTIO_IOMMU_F_MAP_UNMAP,
+    VHOST_INVALID_FEATURE_BIT
+};
+
 static const size_t virtio_iommu_table_prop_size[] = {
     [VIRTIO_IOMMU_FORMAT_PGTF_VIRT] = 0,
     [VIRTIO_IOMMU_FORMAT_PGTF_VTD] = sizeof(struct virtio_iommu_probe_pgt_vtd),
@@ -126,6 +141,18 @@ static bool virtio_iommu_device_bypassed(IOMMUDevice *sdev)
     if (sdev->idev) {
         bypassed = true;
         goto out;
+    }
+
+    /*
+     * vhost-iommu doesn't currently notify us of ATTACH events, so we won't
+     * know when an endpoint switches from global bypass to translation. So we
+     * need all translations for QEMU devices to go through the xlate ioctl.
+     *
+     * Note that the current vhost-iommu prototype doesn't know about bypass at
+     * all, that's left TODO.
+     */
+    if (s->vhost_iommu) {
+        return false;
     }
 
     sid = virtio_iommu_get_bdf(sdev);
@@ -463,6 +490,36 @@ static inline PASIDAddressSpace *virtio_iommu_get_pasid_as(VirtIOIOMMU *s,
     return pasid_as;
 }
 
+static void vhost_iommu_add_endpoint(VirtIOIOMMU *s, IOMMUDevice *sdev)
+{
+    int ret;
+    PCIDevice *pdev;
+    const VhostOps *vhost_ops = s->vhost_iommu->dev.vhost_ops;
+    struct vhost_iommu_register_endpoint cfg = {
+        .id = PCI_BUILD_BDF(pci_bus_num(sdev->bus), sdev->devfn),
+        .flags = VHOST_IOMMU_SET_PROBE_BUFFER,
+        .probe_buffer = (uintptr_t)s->vhost_iommu->probe_buffer,
+        .probe_size = VIOMMU_PROBE_SIZE,
+    };
+
+    /*
+     * Gnarly. We need a handle that the vhost_kernel_set_iotlb_callback() can
+     * refer to later. The most direct is the PCI address space. FIXME!
+     */
+    pdev = pci_find_device(sdev->bus, pci_bus_num(sdev->bus), sdev->devfn);
+    if (!pdev) {
+        error_report("Could not find PCI device");
+        return;
+    }
+
+    ret = vhost_ops->vhost_iommu_set_endpoint(&s->vhost_iommu->dev,
+                                              pci_get_address_space(pdev),
+                                              &cfg);
+    if (ret) {
+        error_report("Could not add vhost-iommu endpoint");
+    }
+}
+
 static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
                                               int devfn, PCIDevice *dev)
 {
@@ -534,6 +591,10 @@ static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
 
         virtio_iommu_switch_address_space(sdev);
         g_free(name);
+
+        if (s->vhost_iommu) {
+            vhost_iommu_add_endpoint(s, sdev);
+        }
     }
     return &sdev->as;
 }
@@ -1559,6 +1620,53 @@ static int virtio_iommu_walk_page_table(VirtIOIOMMU *s, uint32_t sid,
     return EFAULT;
 }
 
+static IOMMUTLBEntry vhost_iommu_translate(VirtIOIOMMU *s,
+                                           IOMMUMemoryRegion *mr, hwaddr addr,
+                                           IOMMUAccessFlags flag, int iommu_idx)
+{
+    IOMMUDevice *sdev = container_of(mr, IOMMUDevice, iommu_mr);
+    uint32_t sid = virtio_iommu_get_bdf(sdev);
+    int ret;
+
+    IOMMUTLBEntry entry = {
+        .target_as = &address_space_memory,
+        .iova = addr,
+        .translated_addr = addr,
+        .addr_mask = (1 << ctz32(s->config.page_size_mask)) - 1,
+        .perm = IOMMU_NONE,
+    };
+
+    /*
+     * TODO: we really don't want to send an ioctl for each page! The
+     * vhost-iommu device can return the size of the mapping, which we can cache
+     * for the next call to translate().
+     */
+    struct vhost_iommu_xlate xlate = {
+        .imsg = {
+            .iova = addr,
+            .size = 1,
+            .perm = (flag & IOMMU_RO ? VHOST_ACCESS_RO : 0) |
+                    (flag & IOMMU_WO ? VHOST_ACCESS_WO : 0),
+            .type = VHOST_IOTLB_MISS,
+        },
+        .epid = sid,
+    };
+
+    ret = ioctl(s->vhost_iommu->fd, VHOST_IOMMU_XLATE, &xlate);
+    if (ret) {
+        perror("VHOST_IOMMU_XLATE");
+        return entry;
+    }
+
+    /*
+     * vhost-iommu doesn't know about the GPA->HPA translation, so the returned
+     * address is a GPA. So it's all good?
+     */
+    entry.translated_addr = xlate.imsg.uaddr;
+    entry.perm = flag;
+    return entry;
+}
+
 static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
                                             IOMMUAccessFlags flag,
                                             int iommu_idx)
@@ -1621,23 +1729,6 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     trace_virtio_iommu_translate(mr->parent_obj.name, sid, addr, flag);
     qemu_rec_mutex_lock(&s->mutex);
 
-    ep = g_tree_lookup(s->endpoints, GUINT_TO_POINTER(sid));
-
-    if (bypass_allowed)
-        assert(ep && ep->domain && !ep->domain->bypass);
-
-    if (!ep) {
-        if (!bypass_allowed) {
-            error_report_once("%s sid=%d is not known!!", __func__, sid);
-            virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_UNKNOWN,
-                                      VIRTIO_IOMMU_FAULT_F_ADDRESS,
-                                      sid, addr);
-        } else {
-            entry.perm = flag;
-        }
-        goto unlock;
-    }
-
     for (i = 0; i < s->nb_reserved_regions; i++) {
         ReservedRegion *reg = &s->reserved_regions[i];
 
@@ -1656,6 +1747,29 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
             goto unlock;
         }
     }
+
+    if (s->vhost_iommu) {
+        qemu_rec_mutex_unlock(&s->mutex);
+        return vhost_iommu_translate(s, mr, addr, flag, iommu_idx);
+    }
+
+    ep = g_tree_lookup(s->endpoints, GUINT_TO_POINTER(sid));
+
+    if (bypass_allowed)
+        assert(ep && ep->domain && !ep->domain->bypass);
+
+    if (!ep) {
+        if (!bypass_allowed) {
+            error_report_once("%s sid=%d is not known!!", __func__, sid);
+            virtio_iommu_report_fault(s, VIRTIO_IOMMU_FAULT_R_UNKNOWN,
+                                      VIRTIO_IOMMU_FAULT_F_ADDRESS,
+                                      sid, addr);
+        } else {
+            entry.perm = flag;
+        }
+        goto unlock;
+    }
+
 
     if (!ep->domain) {
         if (!bypass_allowed) {
@@ -1739,6 +1853,12 @@ static uint64_t virtio_iommu_get_features(VirtIODevice *vdev, uint64_t f,
     VirtIOIOMMU *dev = VIRTIO_IOMMU(vdev);
 
     f |= dev->features;
+
+    if (dev->vhost_iommu) {
+        f = vhost_get_features(&dev->vhost_iommu->dev,
+                               vhost_iommu_feature_bits, f);
+    }
+
     trace_virtio_iommu_get_features(f);
     return f;
 }
@@ -1870,6 +1990,142 @@ static void virtio_iommu_system_reset(void *opaque)
     virtio_iommu_switch_address_space_all(s);
 }
 
+
+static void vhost_iommu_init(VirtIOIOMMU *s, Error **errp)
+{
+    int fd, ret;
+    struct vhost_iommu_ *vhost_iommu;
+
+    if (!s->use_vhost) {
+        return;
+    }
+
+    vhost_iommu = g_malloc0(sizeof(*vhost_iommu));
+
+    fd = open("/dev/vhost-iommu", O_RDWR);
+
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "while opening /dev/vhost-iommu");
+        return;
+    }
+
+    vhost_iommu->probe_buffer = g_malloc0(VIOMMU_PROBE_SIZE);
+    /* At the moment all endpoints have the same probe content */
+    virtio_iommu_fill_resv_mem_prop(s, -1, vhost_iommu->probe_buffer,
+                                    VIOMMU_PROBE_SIZE);
+
+    vhost_iommu->dev.max_queues = 1;
+    vhost_iommu->dev.nvqs = 2;
+    vhost_iommu->dev.vqs = g_malloc0_n(vhost_iommu->dev.nvqs,
+                                       sizeof(*vhost_iommu->dev.vqs));
+
+    vhost_iommu->fd = fd;
+    ret = vhost_dev_init(&vhost_iommu->dev, (void *)(uintptr_t)fd,
+                         VHOST_BACKEND_TYPE_KERNEL, 0, errp);
+    if (ret) {
+        return;
+    }
+
+    vhost_ack_features(&vhost_iommu->dev, vhost_iommu_feature_bits, ~0ULL);
+
+    s->vhost_iommu = vhost_iommu;
+}
+
+static void vhost_iommu_cleanup(VirtIOIOMMU *s)
+{
+    struct vhost_iommu_ *vhost_iommu = s->vhost_iommu;
+
+    if (!vhost_iommu) {
+        return;
+    }
+
+    g_free(vhost_iommu->dev.vqs);
+    vhost_dev_cleanup(&vhost_iommu->dev);
+}
+
+static int vhost_iommu_start(VirtIOIOMMU *s)
+{
+    int ret;
+    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(s)));
+    VirtioBusState *vbus = VIRTIO_BUS(qbus);
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+
+    if (!k->set_guest_notifiers) {
+        error_report("binding does not support guest notifiers");
+        return -ENOSYS;
+    }
+
+    /* Setup routing for two queues */
+    ret = k->set_guest_notifiers(qbus->parent, 2, true);
+    if (ret) {
+        error_report("Error binding guest notifier: %d", -ret);
+        return ret;
+    }
+
+    ret = vhost_dev_enable_notifiers(&s->vhost_iommu->dev, vdev);
+    if (ret) {
+        goto err_disable_guest_notifiers;
+    }
+
+    ret = vhost_dev_start(&s->vhost_iommu->dev, vdev, true);
+    if (ret) {
+        error_report("Failed to start vhost device");
+        goto err_disable_notifiers;
+    }
+
+    return 0;
+
+err_disable_notifiers:
+    vhost_dev_disable_notifiers(&s->vhost_iommu->dev, vdev);
+err_disable_guest_notifiers:
+    k->set_guest_notifiers(qbus->parent, 2, false);
+    return ret;
+}
+
+static void vhost_iommu_stop(VirtIOIOMMU *s)
+{
+    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(s)));
+    VirtioBusState *vbus = VIRTIO_BUS(qbus);
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+
+    vhost_dev_stop(&s->vhost_iommu->dev, vdev, true);
+    vhost_dev_disable_notifiers(&s->vhost_iommu->dev, vdev);
+    k->set_guest_notifiers(qbus->parent, 2, false);
+}
+
+static int vhost_iommu_status(VirtIOIOMMU *s, uint8_t status)
+{
+    int ret = 0;
+    struct vhost_dev *hdev = &s->vhost_iommu->dev;
+    bool started = status & VIRTIO_CONFIG_S_DRIVER_OK;
+
+    if (!s->vhost_iommu || started == s->vhost_iommu->started) {
+        return 0;
+    }
+
+    if (started) {
+        ret = vhost_iommu_start(s);
+        if (ret) {
+            error_report("Failed to start vhost-iommu: %d", ret);
+        }
+    } else {
+        vhost_iommu_stop(s);
+    }
+
+    if (hdev->vhost_ops->vhost_iommu_set_status) {
+        ret = hdev->vhost_ops->vhost_iommu_set_status(hdev, status);
+        if (ret) {
+            error_report("Failed to set status: %d", ret);
+        }
+    }
+
+    s->vhost_iommu->started = started;
+
+    return ret;
+}
+
 static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
@@ -1944,6 +2200,8 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
                                    NULL, NULL, virtio_iommu_put_pasid_as);
 
     qemu_register_reset(virtio_iommu_system_reset, s);
+
+    vhost_iommu_init(s, errp);
 }
 
 static void virtio_iommu_device_unrealize(DeviceState *dev)
@@ -1953,6 +2211,8 @@ static void virtio_iommu_device_unrealize(DeviceState *dev)
     int i;
 
     qemu_unregister_reset(virtio_iommu_system_reset, s);
+
+    vhost_iommu_cleanup(s);
 
     g_hash_table_destroy(s->as_by_busptr);
     if (s->domains) {
@@ -1994,6 +2254,8 @@ static void virtio_iommu_device_reset(VirtIODevice *vdev)
 static void virtio_iommu_set_status(VirtIODevice *vdev, uint8_t status)
 {
     trace_virtio_iommu_device_status(status);
+
+    vhost_iommu_status(VIRTIO_IOMMU(vdev), status);
 }
 
 static void virtio_iommu_instance_init(Object *obj)
@@ -2131,6 +2393,7 @@ static Property virtio_iommu_properties[] = {
     DEFINE_PROP_UINT16("num-queues", VirtIOIOMMU, num_queues, 1),
     DEFINE_PROP_BOOL("page-tables", VirtIOIOMMU, page_tables, false),
     DEFINE_PROP_BOOL("posted-map", VirtIOIOMMU, posted_map, false),
+    DEFINE_PROP_BOOL("vhost", VirtIOIOMMU, use_vhost, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
