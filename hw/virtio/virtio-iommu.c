@@ -118,6 +118,7 @@ static const int vhost_iommu_feature_bits[] = {
     VIRTIO_IOMMU_F_INPUT_RANGE,
     VIRTIO_IOMMU_F_DOMAIN_RANGE,
     VIRTIO_IOMMU_F_MAP_UNMAP,
+    VIRTIO_IOMMU_F_ATTACH_TABLE,
     VHOST_INVALID_FEATURE_BIT
 };
 
@@ -1990,6 +1991,35 @@ static void virtio_iommu_system_reset(void *opaque)
     virtio_iommu_switch_address_space_all(s);
 }
 
+static int vhost_iommu_fill_probe(VirtIOIOMMU *s, struct vhost_iommu_ *vhost_iommu)
+{
+    ssize_t count;
+    ssize_t free = VIOMMU_PROBE_SIZE;
+    uint8_t *buf;
+
+    /* TODO: merge this with probe req */
+
+    buf = vhost_iommu->probe_buffer = g_malloc0(free);
+    count = virtio_iommu_fill_resv_mem_prop(s, -1, buf, free);
+    if (count < 0) {
+        goto err_free;
+    }
+
+    buf += count;
+    free -= count;
+    if (s->page_tables) {
+        count = virtio_iommu_fill_virt_table_prop(s, -1, buf, free);
+        if (count < 0) {
+            goto err_free;
+        }
+    }
+    return 0;
+
+err_free:
+    g_free(buf);
+    vhost_iommu->probe_buffer = NULL;
+    return -EINVAL;
+}
 
 static void vhost_iommu_init(VirtIOIOMMU *s, Error **errp)
 {
@@ -2009,10 +2039,12 @@ static void vhost_iommu_init(VirtIOIOMMU *s, Error **errp)
         return;
     }
 
-    vhost_iommu->probe_buffer = g_malloc0(VIOMMU_PROBE_SIZE);
     /* At the moment all endpoints have the same probe content */
-    virtio_iommu_fill_resv_mem_prop(s, -1, vhost_iommu->probe_buffer,
-                                    VIOMMU_PROBE_SIZE);
+    ret = vhost_iommu_fill_probe(s, vhost_iommu);
+    if (ret) {
+        error_setg(errp, "Could not fill probe request");
+        return;
+    }
 
     vhost_iommu->dev.max_queues = 1;
     vhost_iommu->dev.nvqs = 2;
