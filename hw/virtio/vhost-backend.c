@@ -392,6 +392,11 @@ static int vhost_kernel_iommu_set_endpoint(struct vhost_dev *dev,
     return 0;
 }
 
+static int vhost_kernel_iommu_set_status(struct vhost_dev *dev, uint8_t status)
+{
+    return vhost_kernel_call(dev, VHOST_IOMMU_SET_STATUS, &status);
+}
+
 const VhostOps kernel_ops = {
         .backend_type = VHOST_BACKEND_TYPE_KERNEL,
         .vhost_backend_init = vhost_kernel_init,
@@ -424,6 +429,7 @@ const VhostOps kernel_ops = {
         .vhost_set_iotlb_callback = vhost_kernel_set_iotlb_callback,
         .vhost_send_device_iotlb_msg = vhost_kernel_send_device_iotlb_msg,
         .vhost_iommu_set_endpoint = vhost_kernel_iommu_set_endpoint,
+        .vhost_iommu_set_status = vhost_kernel_iommu_set_status,
 //        .vhost_iommu_xlate = vhost_kernel_iommu_xlate,
 };
 #endif

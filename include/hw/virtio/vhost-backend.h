@@ -135,6 +135,8 @@ typedef int (*vhost_iommu_set_endpoint_op)(struct vhost_dev *dev,
                                           AddressSpace *as,
 					   struct vhost_iommu_register_endpoint *cfg);
 
+typedef int (*vhost_iommu_set_status_op)(struct vhost_dev *dev, uint8_t status);
+
 typedef struct VhostOps {
     VhostBackendType backend_type;
     vhost_backend_init vhost_backend_init;
@@ -183,6 +185,7 @@ typedef struct VhostOps {
     vhost_force_iommu_op vhost_force_iommu;
     vhost_set_config_call_op vhost_set_config_call;
     vhost_iommu_set_endpoint_op vhost_iommu_set_endpoint;
+    vhost_iommu_set_status_op vhost_iommu_set_status;
 } VhostOps;
 
 int vhost_backend_update_device_iotlb(struct vhost_dev *dev,
