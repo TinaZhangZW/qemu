@@ -479,8 +479,42 @@ static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
     return &sdev->as;
 }
 
+static int virtio_iommu_set_iommu_device(PCIBus *bus, void *opaque,
+                                     int devfn, IOMMUFDDevice *idev)
+{
+    VirtIOIOMMU *s = opaque;
+    IOMMUPciBus *sbus = g_hash_table_lookup(s->as_by_busptr, bus);
+    IOMMUDevice *sdev;
+
+    qemu_rec_mutex_lock(&s->mutex);
+    assert(sbus);
+    sdev = sbus->pbdev[devfn];
+    assert(sdev);
+    sdev->idev = idev;
+    qemu_rec_mutex_unlock(&s->mutex);
+
+    return 0;
+}
+
+static void virtio_iommu_unset_iommu_device(PCIBus *bus, void *opaque,
+                                            int devfn)
+{
+    VirtIOIOMMU *s = opaque;
+    IOMMUPciBus *sbus = g_hash_table_lookup(s->as_by_busptr, bus);
+    IOMMUDevice *sdev;
+
+    qemu_rec_mutex_lock(&s->mutex);
+    assert(sbus);
+    sdev = sbus->pbdev[devfn];
+    assert(sdev);
+    sdev->idev = NULL;
+    qemu_rec_mutex_unlock(&s->mutex);
+}
+
 static const PCIIOMMUOps virtio_iommu_ops = {
     .get_address_space = virtio_iommu_find_add_as,
+    .set_iommu_device = virtio_iommu_set_iommu_device,
+    .unset_iommu_device = virtio_iommu_unset_iommu_device,
 };
 
 static int __virtio_iommu_attach(VirtIOIOMMU *s, uint32_t domain_id,
