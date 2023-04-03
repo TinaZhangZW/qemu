@@ -31,12 +31,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOIOMMU, VIRTIO_IOMMU)
 
 #define TYPE_VIRTIO_IOMMU_MEMORY_REGION "virtio-iommu-memory-region"
 
+typedef struct Hwpt {
+    uint32_t hwpt_id;
+    int iommufd;
+    uint32_t parent_id; /* ioas_id or hwpt_id */
+    uint32_t users;
+} Hwpt;
+
+typedef struct PASIDAddressSpace {
+    PCIBus *bus;
+    uint8_t devfn;
+    uint32_t pasid;
+    Hwpt hwpt;
+} PASIDAddressSpace;
+
+typedef struct IOMMUAddressSpace {
+    PCIBus *bus;
+    uint8_t devfn;
+    uint32_t pasid;
+    AddressSpace  as;
+} IOMMUAddressSpace;
+
 typedef struct IOMMUDevice {
     void         *viommu;
     PCIBus       *bus;
     int           devfn;
     IOMMUMemoryRegion  iommu_mr;
-    AddressSpace  as;
     MemoryRegion root;          /* The root container of the device */
     MemoryRegion bypass_mr;     /* The alias of shared memory MR */
     IOMMUFDDevice *idev;
@@ -67,6 +87,9 @@ struct VirtIOIOMMU {
     uint16_t num_queues;
     bool page_tables;
     void *hw_info;
+    GHashTable *address_spaces;       /* IOMMUAddressSpace instances */
+    GHashTable *pasid_ass;       /* PASIDAddressSpace instances */
+    Hwpt *s2_hwpt;
 };
 
 #endif

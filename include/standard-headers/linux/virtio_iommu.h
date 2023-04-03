@@ -86,11 +86,13 @@ struct virtio_iommu_req_attach {
 	struct virtio_iommu_req_tail		tail;
 };
 
+#define VIRTIO_IOMMU_DETACH_F_PASID        (1 << 0)
 struct virtio_iommu_req_detach {
 	struct virtio_iommu_req_head		head;
 	uint32_t					domain;
 	uint32_t					endpoint;
-	uint8_t					reserved[8];
+	uint32_t                flags;
+	uint32_t                pasid;
 	struct virtio_iommu_req_tail		tail;
 };
 
