@@ -1145,9 +1145,8 @@ static void virtio_iommu_system_reset(void *opaque)
      * config.bypass is sticky across device reset, but should be restored on
      * system reset
      */
-    s->config.bypass = s->boot_bypass;
+    s->config.bypass = s->bypass_feature && s->boot_bypass;
     virtio_iommu_switch_address_space_all(s);
-
 }
 
 static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
@@ -1181,7 +1180,9 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MAP_UNMAP);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MMIO);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_PROBE);
-    virtio_add_feature(&s->features, VIRTIO_IOMMU_F_BYPASS_CONFIG);
+    if (s->bypass_feature) {
+        virtio_add_feature(&s->features, VIRTIO_IOMMU_F_BYPASS_CONFIG);
+    }
 
     qemu_rec_mutex_init(&s->mutex);
 
@@ -1372,6 +1373,7 @@ static const VMStateDescription vmstate_virtio_iommu = {
 static Property virtio_iommu_properties[] = {
     DEFINE_PROP_LINK("primary-bus", VirtIOIOMMU, primary_bus, "PCI", PCIBus *),
     DEFINE_PROP_BOOL("boot-bypass", VirtIOIOMMU, boot_bypass, true),
+    DEFINE_PROP_BOOL("bypass-feature", VirtIOIOMMU, bypass_feature, true),
     DEFINE_PROP_END_OF_LIST(),
 };
 
