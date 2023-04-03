@@ -122,6 +122,11 @@ static bool virtio_iommu_device_bypassed(IOMMUDevice *sdev)
     VirtIOIOMMU *s = sdev->viommu;
     VirtIOIOMMUEndpoint *ep;
 
+    if (sdev->idev) {
+        bypassed = true;
+        goto out;
+    }
+
     sid = virtio_iommu_get_bdf(sdev);
 
     qemu_rec_mutex_lock(&s->mutex);
@@ -140,6 +145,7 @@ static bool virtio_iommu_device_bypassed(IOMMUDevice *sdev)
 
 unlock:
     qemu_rec_mutex_unlock(&s->mutex);
+out:
     return bypassed;
 }
 
@@ -440,14 +446,23 @@ static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
 
     sdev = sbus->pbdev[devfn];
     if (!sdev) {
+        PASIDAddressSpace *pasid_as;
         char *name = g_strdup_printf("%s-%d-%d",
                                      TYPE_VIRTIO_IOMMU_MEMORY_REGION,
                                      mr_index++, devfn);
+        uint64_t rid = PCI_BUILD_BDF(pci_bus_num(bus), devfn);
+        uint64_t rid_pasid = (rid << 32) | PCI_NO_PASID;
+
         sdev = sbus->pbdev[devfn] = g_new0(IOMMUDevice, 1);
 
         sdev->viommu = s;
         sdev->bus = bus;
         sdev->devfn = devfn;
+
+        pasid_as = g_malloc0(sizeof(struct PASIDAddressSpace));
+        pasid_as->bus = bus;
+        pasid_as->devfn = devfn;
+        g_tree_insert(s->pasid_ass, GUINT_TO_POINTER(rid_pasid), pasid_as);
 
         trace_virtio_iommu_init_iommu_mr(name);
 
@@ -523,6 +538,13 @@ static void virtio_iommu_get_hw_info(VirtIOIOMMU *s,
     }
 
     return;
+}
+
+static void virtio_iommu_put_pasid_as(gpointer data)
+{
+    PASIDAddressSpace *pasid_as = (PASIDAddressSpace *)data;
+
+    g_free(pasid_as);
 }
 
 static int virtio_iommu_set_iommu_device(PCIBus *bus, void *opaque,
@@ -1662,6 +1684,9 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "VIRTIO-IOMMU is not attached to any PCI bus!");
     }
 
+    s->pasid_ass = g_tree_new_full((GCompareDataFunc)int_cmp,
+                                   NULL, NULL, virtio_iommu_put_pasid_as);
+
     qemu_register_reset(virtio_iommu_system_reset, s);
 }
 
@@ -1679,6 +1704,9 @@ static void virtio_iommu_device_unrealize(DeviceState *dev)
     }
     if (s->endpoints) {
         g_tree_destroy(s->endpoints);
+    }
+    if (s->pasid_ass) {
+        g_tree_destroy(s->pasid_ass);
     }
 
     qemu_rec_mutex_destroy(&s->mutex);
