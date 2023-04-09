@@ -1512,6 +1512,9 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MAP_UNMAP);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MMIO);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_PROBE);
+    if (s->bypass_feature) {
+        virtio_add_feature(&s->features, VIRTIO_IOMMU_F_BYPASS_CONFIG);
+    }
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MQ);
     if (s->page_tables) {
         virtio_add_feature(&s->features, VIRTIO_IOMMU_F_ATTACH_TABLE);
