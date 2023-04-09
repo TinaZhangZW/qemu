@@ -968,6 +968,83 @@ static int virtio_iommu_unmap(VirtIOIOMMU *s,
     return ret;
 }
 
+static void virtio_iommu_invalidate_va(VirtIOIOMMU *s,
+                                       uint32_t ep_id,
+                                       hwaddr start_addr,
+                                       hwaddr end_addr,
+                                       uint32_t pasid,
+                                       uint16_t flags)
+{
+    struct iommu_hwpt_invalidate_intel_vtd *cache_info;
+    PASIDAddressSpace *pasid_as;
+    IOMMUDevice *sdev;
+    uint64_t pages = (end_addr - start_addr + 1) >> 12;
+    unsigned int mask = 64 - clz64(pages - 1);
+    unsigned int aligned_pages = 1 << mask;
+    unsigned long bitmask = aligned_pages - 1;
+    unsigned long pfn = start_addr >> 12;
+
+    if (unlikely(bitmask & pfn)) {
+        unsigned long end_pfn = pfn + pages - 1, shared_bits;
+
+        shared_bits = ~(pfn ^ end_pfn) & ~bitmask;
+        mask = shared_bits ? (64 - clo64(shared_bits)) : BITS_PER_LONG;
+    }
+
+    sdev = virtio_iommu_get_iommu_device(s, ep_id);
+    if (!sdev || !sdev->idev)
+        return;
+
+    pasid_as = virtio_iommu_get_pasid_as(s, ep_id, PCI_NO_PASID);
+    if (!pasid_as)
+        return;
+
+    cache_info = g_malloc0(sizeof(*cache_info));
+    cache_info->granularity = IOMMU_VTD_QI_GRAN_ADDR;
+    if (flags & VIRTIO_IOMMU_INVAL_F_LEAF)
+        cache_info->flags |= IOMMU_VTD_QI_FLAGS_LEAF;
+    cache_info->addr = start_addr;
+    cache_info->granule_size = 1 << 12;
+    cache_info->nb_granules = 1 << mask;
+
+    /* TODO: When guest pasid is provided, get the hwpt_id according to the pasid */
+    if (iommufd_backend_invalidate_cache(pasid_as->hwpt.iommufd,
+                                         pasid_as->hwpt.hwpt_id,
+                                         IOMMU_HWPT_TYPE_VTD_S1,
+                                         sizeof(*cache_info), cache_info)) {
+        error_report("Cache flush failed");
+    }
+
+    g_free(cache_info);
+}
+
+static void virtio_iommu_invalidate_pasid(VirtIOIOMMU *s,
+                                          uint32_t ep_id,
+                                          uint32_t pasid)
+{
+    struct iommu_hwpt_invalidate_intel_vtd *cache_info;
+    PASIDAddressSpace *pasid_as;
+    IOMMUDevice *sdev;
+
+    sdev = virtio_iommu_get_iommu_device(s, ep_id);
+    if (!sdev || !sdev->idev)
+        return;
+
+    pasid_as = virtio_iommu_get_pasid_as(s, ep_id, PCI_NO_PASID);
+    if (!pasid_as)
+        return;
+
+    cache_info = g_malloc0(sizeof(*cache_info));
+    cache_info->granularity = IOMMU_VTD_QI_GRAN_DOMAIN;
+
+    if (iommufd_backend_invalidate_cache(pasid_as->hwpt.iommufd,
+                                         pasid_as->hwpt.hwpt_id,
+                                         IOMMU_HWPT_TYPE_VTD_S1,
+                                         sizeof(cache_info), cache_info)) {
+        error_report("Cache flush failed");
+    }
+}
+
 static int virtio_iommu_invalidate(VirtIOIOMMU *s,
                                    struct virtio_iommu_req_invalidate *req)
 {
@@ -976,6 +1053,10 @@ static int virtio_iommu_invalidate(VirtIOIOMMU *s,
     int ret = VIRTIO_IOMMU_S_OK;
     hwaddr start_addr, end_addr, nr_pages;
     uint32_t domain_id = le32_to_cpu(req->domain);
+    uint32_t pasid = le32_to_cpu(req->pasid);
+    uint16_t flags = le16_to_cpu(req->flags);
+    uint16_t format =
+        le16_to_cpu(((struct virtio_iommu_probe_table_format *)(s->hw_info))->format);
 
     domain = g_tree_lookup(s->domains, GUINT_TO_POINTER(domain_id));
     if (!domain) {
@@ -1002,12 +1083,30 @@ static int virtio_iommu_invalidate(VirtIOIOMMU *s,
     case VIRTIO_IOMMU_INVAL_G_PASID:
         start_addr = 0;
         end_addr = ~0UL;
+        if (format == VIRTIO_IOMMU_FORMAT_PGTF_VTD) {
+            /*
+             * TODO: Can one virtio_iommu_invalidate_pasid invocation flush
+             * all dev-IOTLB of devices belonging to a domain?
+             */
+            QLIST_FOREACH(ep, &domain->endpoint_list, next) {
+                virtio_iommu_invalidate_pasid(s, ep->id, pasid);
+            }
+        }
         trace_virtio_iommu_inval_domain(domain_id);
         break;
     case VIRTIO_IOMMU_INVAL_G_VA:
         start_addr = le64_to_cpu(req->virt_start);
         nr_pages = le64_to_cpu(req->nr_pages);
         end_addr = start_addr + nr_pages * (1 << req->granule) - 1;
+        /*
+         * TODO: Can one virtio_iommu_invalidate_va invocation flush
+         * all dev-IOTLB of devices belonging to a domain?
+         */
+        if (format == VIRTIO_IOMMU_FORMAT_PGTF_VTD) {
+            QLIST_FOREACH(ep, &domain->endpoint_list, next) {
+                virtio_iommu_invalidate_va(s, ep->id, start_addr, end_addr, pasid, flags);
+            }
+        }
         trace_virtio_iommu_inval_range(domain_id, start_addr, end_addr);
         break;
     default:
