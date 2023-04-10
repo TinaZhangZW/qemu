@@ -89,6 +89,7 @@ struct VirtIOIOMMU {
     bool posted_map;
     IDRegs *id_regs;
     GTree *pasid_ass;       /* PASIDAddressSpace instances */
+    Hwpt *s2_hwpt;
 };
 
 #endif

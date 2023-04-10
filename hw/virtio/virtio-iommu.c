@@ -36,6 +36,7 @@
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci.h"
 
+#include "sysemu/iommufd.h"
 
 #define VIRT_PGTABLE_SIZE               0x1000
 #define VIRT_PGTABLE_PTE_SIZE           8
@@ -418,6 +419,39 @@ static void virtio_iommu_put_domain(gpointer data)
     g_free(domain);
 }
 
+static inline IOMMUDevice *virtio_iommu_get_iommu_device(VirtIOIOMMU *s,
+                                                        uint32_t ep_id)
+{
+    uint8_t bus_num = PCI_BUS_NUM(ep_id);
+    IOMMUPciBus *sbus = iommu_find_iommu_pcibus(s, bus_num);
+    uint8_t devfn = PCI_BDF_TO_DEVFN(ep_id);
+    IOMMUDevice *sdev;
+
+    if (!sbus)
+        return NULL;
+
+    sdev = sbus->pbdev[devfn];
+    if (!sdev)
+        return NULL;
+
+    return sdev;
+}
+
+static inline PASIDAddressSpace *virtio_iommu_get_pasid_as(VirtIOIOMMU *s,
+                                                    uint32_t ep_id,
+                                                    uint32_t pasid)
+{
+    uint64_t rid = ep_id;
+    uint64_t rid_pasid = (rid << 32) | pasid;
+    PASIDAddressSpace *pasid_as;
+
+    pasid_as = g_tree_lookup(s->pasid_ass, GUINT_TO_POINTER(rid_pasid));
+    if (!pasid_as)
+        return NULL;
+
+    return pasid_as;
+}
+
 static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
                                               int devfn, PCIDevice *dev)
 {
@@ -624,6 +658,120 @@ static int virtio_iommu_attach(VirtIOIOMMU *s,
     return __virtio_iommu_attach(s, domain_id, ep_id, flags, &domain);
 }
 
+static void virtio_iommu_init_vtd_pgtbl_data(struct iommu_hwpt_intel_vtd *vtd,
+                                 struct virtio_iommu_req_attach_pgt_vtd *req)
+{
+    memset(vtd, 0, sizeof(*vtd));
+
+    vtd->flags = le64_to_cpu(req->fl_flags);
+    vtd->pat = le32_to_cpu(req->pat);
+    vtd->emt = le32_to_cpu(req->emt);
+    vtd->addr_width = le32_to_cpu(req->addr_width);
+    vtd->pgtbl_addr = le64_to_cpu(req->pgd);
+}
+
+static int virtio_iommu_get_s2_hwpt(VirtIOIOMMU *s, IOMMUFDDevice *idev,
+                           uint32_t *s2_hwpt)
+{
+    int ret;
+
+    if (s->s2_hwpt) {
+        *s2_hwpt = s->s2_hwpt->hwpt_id;
+        s->s2_hwpt->users++;
+        return 0;
+    }
+    ret = iommufd_backend_alloc_hwpt(idev->iommufd, idev->dev_id,
+                                     idev->ioas_id, IOMMU_HWPT_TYPE_DEFAULT,
+                                     0, NULL, s2_hwpt);
+    if (!ret) {
+        s->s2_hwpt = g_malloc0(sizeof(*s->s2_hwpt));
+        s->s2_hwpt->hwpt_id = *s2_hwpt;
+        s->s2_hwpt->iommufd = idev->iommufd;
+        s->s2_hwpt->parent_id = idev->ioas_id;
+        s->s2_hwpt->users = 1;
+    }
+    return ret;
+}
+
+static void virtio_iommu_put_s2_hwpt(VirtIOIOMMU *s)
+{
+    if (!s->s2_hwpt) {
+        return;
+    }
+
+    if (--s->s2_hwpt->users) {
+        return;
+    }
+    iommufd_backend_free_id(s->s2_hwpt->iommufd, s->s2_hwpt->hwpt_id);
+    g_free(s->s2_hwpt);
+    s->s2_hwpt = NULL;
+}
+
+static int vtd_init_fl_hwpt(VirtIOIOMMU *s,
+                            Hwpt *hwpt,
+                            IOMMUFDDevice *idev,
+                            struct virtio_iommu_req_attach_pgt_vtd *req)
+{
+    struct iommu_hwpt_intel_vtd vtd;
+    uint32_t hwpt_id, s2_hwptid;
+    int ret = 0;
+
+    virtio_iommu_init_vtd_pgtbl_data(&vtd, req);
+
+    ret = virtio_iommu_get_s2_hwpt(s, idev, &s2_hwptid);
+    if (ret)
+        return ret;
+
+    ret = iommufd_backend_alloc_hwpt(idev->iommufd, idev->dev_id,
+                                     s2_hwptid, IOMMU_HWPT_TYPE_VTD_S1,
+                                     sizeof(vtd), &vtd, &hwpt_id);
+    if (ret) {
+        virtio_iommu_put_s2_hwpt(s);
+        return ret;
+    }
+
+    hwpt->hwpt_id = hwpt_id;
+    hwpt->iommufd = idev->iommufd;
+    hwpt->parent_id = s2_hwptid;
+    return 0;
+}
+
+static void virtio_iommu_destroy_fl_hwpt(VirtIOIOMMU *s, Hwpt *hwpt)
+{
+    iommufd_backend_free_id(hwpt->iommufd, hwpt->hwpt_id);
+    virtio_iommu_put_s2_hwpt(s);
+}
+
+static int virtio_iommu_attach_vtd_pgtbl(VirtIOIOMMU *s,
+                                 struct virtio_iommu_req_attach_pgt_vtd *req)
+{
+    uint32_t ep_id = le32_to_cpu(req->endpoint);
+    PASIDAddressSpace *pasid_as;
+    IOMMUDevice *sdev;
+    int ret = -1;
+
+    sdev = virtio_iommu_get_iommu_device(s, ep_id);
+    if (!sdev || !sdev->idev)
+        return ret;             /* e.g. emulated devices */
+
+    pasid_as = virtio_iommu_get_pasid_as(s, ep_id, PCI_NO_PASID);
+    if (!pasid_as)
+        return ret;
+
+    ret = vtd_init_fl_hwpt(s, &pasid_as->hwpt, sdev->idev, req);
+    if (ret)
+        return ret;
+
+    /* TODO: Add handling of re-attaching. */
+
+    ret = iommufd_device_attach_hwpt(sdev->idev, pasid_as->hwpt.hwpt_id);
+    if (ret) {
+        virtio_iommu_destroy_fl_hwpt(s, &pasid_as->hwpt);
+    }
+
+    return ret;
+}
+
 static int virtio_iommu_attach_table(VirtIOIOMMU *s,
                                      struct virtio_iommu_req_attach_table *req)
 {
@@ -643,6 +791,15 @@ static int virtio_iommu_attach_table(VirtIOIOMMU *s,
     switch (format) {
     case VIRTIO_IOMMU_FORMAT_PGTF_VIRT: {
         struct virtio_iommu_req_attach_pgt_virt *vreq = (void *)req;
+
+        domain->pgd = le64_to_cpu(vreq->pgd);
+        }
+        break;
+    case VIRTIO_IOMMU_FORMAT_PGTF_VTD: {
+        struct virtio_iommu_req_attach_pgt_vtd *vreq = (void *)req;
+
+        if (virtio_iommu_attach_vtd_pgtbl(s, vreq))
+            return VIRTIO_IOMMU_S_INVAL;
 
         domain->pgd = le64_to_cpu(vreq->pgd);
         }
