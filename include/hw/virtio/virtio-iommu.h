@@ -47,6 +47,12 @@ typedef struct IOMMUPciBus {
     IOMMUDevice  *pbdev[]; /* Parent array is sparse, so dynamically alloc */
 } IOMMUPciBus;
 
+typedef struct IDRegs {
+    uint8_t type;
+    uint8_t size;
+    uint8_t regs[];
+} IDRegs;
+
 struct VirtIOIOMMU {
     VirtIODevice parent_obj;
     VirtQueue *event_vq;
@@ -67,6 +73,7 @@ struct VirtIOIOMMU {
     uint16_t num_queues;
     bool page_tables;
     bool posted_map;
+    IDRegs *id_regs;
 };
 
 #endif

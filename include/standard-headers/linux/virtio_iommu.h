@@ -176,6 +176,7 @@ struct virtio_iommu_req_unmap {
 #define VIRTIO_IOMMU_PROBE_T_PASID_SIZE		5
 #define VIRTIO_IOMMU_PROBE_T_PAGE_TABLE_FMT	6
 #define VIRTIO_IOMMU_PROBE_T_PASID_TABLE_FMT	7
+#define VIRTIO_IOMMU_PROBE_T_ID_REGS		8
 
 #define VIRTIO_IOMMU_PROBE_T_MASK		0xfff
 
@@ -218,6 +219,13 @@ struct virtio_iommu_probe_pasid_size {
 	struct virtio_iommu_probe_property	head;
 	uint8_t					bits;
 	uint8_t					reserved[3];
+};
+
+struct virtio_iommu_probe_id_regs {
+	struct virtio_iommu_probe_property	head;
+	uint8_t					reserved[2];
+	uint16_t				type;
+	uint8_t					regs[];
 };
 
 /* Arm LPAE page table format */
