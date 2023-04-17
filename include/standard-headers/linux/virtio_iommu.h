@@ -226,6 +226,8 @@ struct virtio_iommu_probe_pasid_size {
 #define VIRTIO_IOMMU_FORMAT_PSTF_ARM_SMMU_V3	2
 /* Virt I/O page table format */
 #define VIRTIO_IOMMU_FORMAT_PGTF_VIRT		3
+/* VT-d I/O page table format */
+#define VIRTIO_IOMMU_FORMAT_PGTF_VTD		4
 
 struct virtio_iommu_probe_table_format {
 	struct virtio_iommu_probe_property	head;
