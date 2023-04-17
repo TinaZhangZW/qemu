@@ -66,6 +66,7 @@ struct VirtIOIOMMU {
     bool granule_frozen;
     uint16_t num_queues;
     bool page_tables;
+    void *hw_info;
 };
 
 #endif
