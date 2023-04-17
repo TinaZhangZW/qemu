@@ -67,6 +67,7 @@ struct VirtIOIOMMU {
     uint16_t num_queues;
     bool page_tables;
     bool posted_map;
+    void *hw_info;
 };
 
 #endif

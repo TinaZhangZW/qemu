@@ -99,6 +99,17 @@ typedef struct VirtIOIOMMUMapping {
     uint32_t flags;
 } VirtIOIOMMUMapping;
 
+typedef struct VirtIOIOMMUHWInfo {
+    union {
+        struct iommu_hw_info_vtd vtd;
+    } data;
+} VirtIOIOMMUHWInfo;
+
+static const size_t virtio_iommu_table_prop_size[] = {
+    [VIRTIO_IOMMU_FORMAT_PGTF_VIRT] = 0,
+    [VIRTIO_IOMMU_FORMAT_PGTF_VTD] = sizeof(struct virtio_iommu_probe_pgt_vtd),
+};
+
 static inline uint16_t virtio_iommu_get_bdf(IOMMUDevice *dev)
 {
     return PCI_BUILD_BDF(pci_bus_num(dev->bus), dev->devfn);
@@ -478,6 +489,42 @@ static AddressSpace *virtio_iommu_find_add_as(PCIBus *bus, void *opaque,
     return &sdev->as;
 }
 
+static void virtio_iommu_get_hw_info(VirtIOIOMMU *s,
+                                    IOMMUFDDevice *idev)
+{
+    VirtIOIOMMUHWInfo info;
+    enum iommu_hw_info_type type = IOMMU_HW_INFO_TYPE_DEFAULT;
+    size_t head_sz = sizeof(struct virtio_iommu_probe_property);
+
+    if (iommufd_device_get_info(idev, &type, sizeof(info.data), &info.data) ||
+        (type == IOMMU_HW_INFO_TYPE_DEFAULT)) {
+        return;
+    }
+
+    switch (type) {
+    case IOMMU_HW_INFO_TYPE_DEFAULT:
+        break;
+    case IOMMU_HW_INFO_TYPE_INTEL_VTD:
+    {
+        struct virtio_iommu_probe_pgt_vtd *hw_info =
+            g_malloc0(sizeof(struct virtio_iommu_probe_pgt_vtd));
+
+        s->hw_info = hw_info;
+        hw_info->head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_TABLE_FMT);
+        hw_info->head.length = cpu_to_le16(sizeof(struct virtio_iommu_probe_pgt_vtd)
+                                             - head_sz);
+        hw_info->format = cpu_to_le16(VIRTIO_IOMMU_FORMAT_PGTF_VTD);
+        hw_info->cap_reg = cpu_to_le64(info.data.vtd.cap_reg);
+        hw_info->ecap_reg = cpu_to_le64(info.data.vtd.ecap_reg);
+        break;
+    }
+    default:
+        break;
+    }
+
+    return;
+}
+
 static int virtio_iommu_set_iommu_device(PCIBus *bus, void *opaque,
                                      int devfn, PCIDevice *dev,
                                      IOMMUFDDevice *idev)
@@ -490,6 +537,10 @@ static int virtio_iommu_set_iommu_device(PCIBus *bus, void *opaque,
     sdev = sbus->pbdev[devfn];
     assert(sdev);
     sdev->idev = idev;
+
+    if (!s->hw_info) {
+        virtio_iommu_get_hw_info(s, idev);
+    }
 
     return 0;
 }
@@ -505,6 +556,9 @@ static void virtio_iommu_unset_iommu_device(PCIBus *bus, void *opaque,
     sdev = sbus->pbdev[devfn];
     assert(sdev);
     sdev->idev = NULL;
+    if (s->hw_info) {
+        g_free(s->hw_info);
+    }
 }
 
 static const PCIIOMMUOps virtio_iommu_ops = {
@@ -835,12 +889,12 @@ static ssize_t virtio_iommu_fill_virt_table_prop(VirtIOIOMMU *s, uint32_t ep,
 {
     size_t size;
     size_t head_sz = sizeof(struct virtio_iommu_probe_property);
+    uint8_t *table_prop_base;
 
     struct {
         struct virtio_iommu_probe_page_size_mask pgsize;
         struct virtio_iommu_probe_input_range input;
         struct virtio_iommu_probe_output_size output;
-        struct virtio_iommu_probe_table_format table;
     } props = {
         .pgsize = {
             .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK),
@@ -858,11 +912,6 @@ static ssize_t virtio_iommu_fill_virt_table_prop(VirtIOIOMMU *s, uint32_t ep,
             .head.length = cpu_to_le16(sizeof(props.output) - head_sz),
             .bits = VIRT_PGTABLE_PA_BITS,
         },
-        .table = {
-            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_TABLE_FMT),
-            .head.length = cpu_to_le16(sizeof(props.table) - head_sz),
-            .format = cpu_to_le16(VIRTIO_IOMMU_FORMAT_PGTF_VIRT),
-        },
     };
 
     size = sizeof(props);
@@ -871,6 +920,30 @@ static ssize_t virtio_iommu_fill_virt_table_prop(VirtIOIOMMU *s, uint32_t ep,
     }
 
     memcpy(buf, &props, size);
+    table_prop_base = buf + size;
+
+    if (s->hw_info) {
+        uint16_t format =
+            le16_to_cpu(((struct virtio_iommu_probe_table_format *)(s->hw_info))->format);
+        size_t table_prop_size = virtio_iommu_table_prop_size[format];
+
+        size += table_prop_size;
+        if (size > free)
+            return -ENOSPC;
+        memcpy(table_prop_base, s->hw_info, table_prop_size);
+    } else {
+        struct virtio_iommu_probe_table_format table ={
+            .head.type = cpu_to_le16(VIRTIO_IOMMU_PROBE_T_PAGE_TABLE_FMT),
+            .head.length = cpu_to_le16(sizeof(table) - head_sz),
+            .format = cpu_to_le16(VIRTIO_IOMMU_FORMAT_PGTF_VIRT),
+        };
+
+        size += sizeof(table);
+        if (size > free)
+            return -ENOSPC;
+
+        memcpy(table_prop_base, &table, sizeof(table));
+    }
 
     return size;
 }

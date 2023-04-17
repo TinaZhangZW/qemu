@@ -141,6 +141,24 @@ struct virtio_iommu_req_attach_pgt_virt {
 	struct virtio_iommu_req_tail		tail;
 };
 
+/* Vt-d I/O Page Table Descriptor */
+struct virtio_iommu_req_attach_pgt_vtd {
+       struct virtio_iommu_req_head             head;
+       uint32_t                                 domain;
+       uint32_t                                 endpoint;
+       uint32_t                                 flags;
+       uint16_t                                 format;
+       uint8_t                                  reserved[2];
+       uint32_t                                 pasid;
+       uint64_t                                 pgd;
+       uint64_t                                 fl_flags;
+       uint32_t                                 pat;
+       uint32_t                                 emt;
+       uint32_t                                 addr_width;
+       uint8_t                                  reserved2[28];
+       struct virtio_iommu_req_tail             tail;
+};
+
 #define VIRTIO_IOMMU_MAP_F_READ			(1 << 0)
 #define VIRTIO_IOMMU_MAP_F_WRITE		(1 << 1)
 #define VIRTIO_IOMMU_MAP_F_MMIO			(1 << 2)
@@ -226,11 +244,21 @@ struct virtio_iommu_probe_pasid_size {
 #define VIRTIO_IOMMU_FORMAT_PSTF_ARM_SMMU_V3	2
 /* Virt I/O page table format */
 #define VIRTIO_IOMMU_FORMAT_PGTF_VIRT		3
+/* VT-d I/O page table format */
+#define VIRTIO_IOMMU_FORMAT_PGTF_VTD		4
 
 struct virtio_iommu_probe_table_format {
 	struct virtio_iommu_probe_property	head;
 	uint16_t					format;
 	uint8_t					reserved[2];
+};
+
+struct virtio_iommu_probe_pgt_vtd {
+       struct virtio_iommu_probe_property       head;
+       uint16_t                                 format;
+       uint8_t                                  reserved[2];
+       uint64_t                                 cap_reg;
+       uint64_t                                 ecap_reg;
 };
 
 struct virtio_iommu_req_probe {
