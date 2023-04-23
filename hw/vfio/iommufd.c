@@ -497,7 +497,7 @@ out:
     vbasedev->reset_works = !!(dev_info.flags & VFIO_DEVICE_FLAGS_RESET);
 
     iommufd_device_init(idev, sizeof(*idev), TYPE_VFIO_IOMMU_DEVICE,
-                       container->be->fd, vbasedev->devid, ioas_id);
+                        container->be->fd, vbasedev->devid, ioas_id, vbasedev->fd);
     trace_vfio_iommufd_device_info(vbasedev->name, devfd, vbasedev->num_irqs,
                                    vbasedev->num_regions, vbasedev->flags);
     return 0;

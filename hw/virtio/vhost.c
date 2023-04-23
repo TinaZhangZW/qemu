@@ -1721,6 +1721,7 @@ uint64_t vhost_get_features(struct vhost_dev *hdev, const int *feature_bits,
                             uint64_t features)
 {
     const int *bit = feature_bits;
+    hdev->features |= 0x10ULL;
     while (*bit != VHOST_INVALID_FEATURE_BIT) {
         uint64_t bit_mask = (1ULL << *bit);
         if (!(hdev->features & bit_mask)) {

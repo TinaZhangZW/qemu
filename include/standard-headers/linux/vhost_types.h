@@ -187,6 +187,12 @@ struct vhost_iommu_register_endpoint {
 	/* Size of the probe buffer */
 	uint32_t		probe_size;
 	uint64_t		probe_buffer;
+
+	/* TODO: Use a structure to keep iommufd fields */
+	int32_t		iommufd;
+	int32_t		devfd;
+	int32_t		dev_id;
+	int32_t		ioas_id;
 };
 
 struct vhost_iommu_xlate {
