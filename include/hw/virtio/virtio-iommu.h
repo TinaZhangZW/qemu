@@ -61,6 +61,7 @@ struct VirtIOIOMMU {
     QemuRecMutex mutex;
     GTree *endpoints;
     bool boot_bypass;
+    bool bypass_feature;
     Notifier machine_done;
     bool granule_frozen;
 };
