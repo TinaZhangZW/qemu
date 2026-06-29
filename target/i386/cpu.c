@@ -8264,8 +8264,8 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
 #endif
 
     case FEAT_8000_0007_EBX:
-        if (cpu && !IS_AMD_CPU(&cpu->env)) {
-            /* Disable AMD machine check architecture for Intel CPU.  */
+        if (cpu && !IS_AMD_OR_HYGON_CPU(&cpu->env)) {
+            /* Disable AMD-style MCA for other vendors. */
             unavail = ~0;
         }
         break;
@@ -8287,14 +8287,15 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
 
     case FEAT_7_0_EDX:
         /*
-         * Windows does not like ARCH_CAPABILITIES on AMD machines at all.
+         * Windows does not like ARCH_CAPABILITIES on AMD/Hygon machines at all.
          * Do not show the fake ARCH_CAPABILITIES MSR that KVM sets up,
          * except if needed for migration.
          *
          * When arch_cap_always_on is removed, this tweak can move to
          * kvm_arch_get_supported_cpuid.
          */
-        if (cpu && IS_AMD_CPU(&cpu->env) && !cpu->arch_cap_always_on) {
+        if (cpu && IS_AMD_OR_HYGON_CPU(&cpu->env) &&
+            !cpu->arch_cap_always_on) {
             unavail = CPUID_7_0_EDX_ARCH_CAPABILITIES;
         }
         break;
@@ -8685,7 +8686,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         if (cpu->cache_info_passthrough) {
             x86_cpu_get_cache_cpuid(index, 0, eax, ebx, ecx, edx);
             break;
-        } else if (cpu->vendor_cpuid_only && IS_AMD_CPU(env)) {
+        } else if (cpu->vendor_cpuid_only && IS_AMD_OR_HYGON_CPU(env)) {
             *eax = *ebx = *ecx = *edx = 0;
             break;
         }
@@ -8721,7 +8722,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                                 CPU_TOPOLOGY_LEVEL_SOCKET), 4095) << 14;
                 }
             }
-        } else if (cpu->vendor_cpuid_only && IS_AMD_CPU(env)) {
+        } else if (cpu->vendor_cpuid_only && IS_AMD_OR_HYGON_CPU(env)) {
             *eax = *ebx = *ecx = *edx = 0;
         } else {
             *eax = 0;
@@ -10139,10 +10140,11 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
         }
     }
 
-    /* On AMD CPUs, some CPUID[8000_0001].EDX bits must match the bits on
+    /*
+     * On AMD/Hygon CPUs, some CPUID[8000_0001].EDX bits must match the bits on
      * CPUID[1].EDX.
      */
-    if (IS_AMD_CPU(env)) {
+    if (IS_AMD_OR_HYGON_CPU(env)) {
         env->features[FEAT_8000_0001_EDX] &= ~CPUID_EXT2_AMD_ALIASES;
         env->features[FEAT_8000_0001_EDX] |= (env->features[FEAT_1_EDX]
            & CPUID_EXT2_AMD_ALIASES);
@@ -10182,7 +10184,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
          * needs to happen after the evenual setting of ucode_rev in
          * accel-specific code in cpu_exec_realizefn.
          */
-        if (IS_AMD_CPU(env)) {
+        if (IS_AMD_OR_HYGON_CPU(env)) {
             cpu->ucode_rev = 0x01000065;
         } else {
             cpu->ucode_rev = 0x100000000ULL;
@@ -10199,15 +10201,15 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     cpu->mwait.ecx |= CPUID_MWAIT_EMX | CPUID_MWAIT_IBE;
 
     /*
-     * Most Intel and certain AMD CPUs support hyperthreading. Even though QEMU
-     * fixes this issue by adjusting CPUID_0000_0001_EBX and CPUID_8000_0008_ECX
-     * based on inputs (sockets,cores,threads), it is still better to give
-     * users a warning.
+     * Most Intel and certain AMD/Hygon CPUs support hyperthreading. Even
+     * though QEMU fixes this issue by adjusting CPUID_0000_0001_EBX and
+     * CPUID_8000_0008_ECX based on inputs (sockets,cores,threads), it is
+     * still better to give users a warning.
      */
-    if (IS_AMD_CPU(env) &&
+    if (IS_AMD_OR_HYGON_CPU(env) &&
         !(env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_TOPOEXT) &&
         env->topo_info.threads_per_core > 1) {
-            warn_report_once("This family of AMD CPU doesn't support "
+            warn_report_once("This family of AMD/Hygon CPU doesn't support "
                              "hyperthreading(%d). Please configure -smp "
                              "options properly or try enabling topoext "
                              "feature.", env->topo_info.threads_per_core);
@@ -10289,7 +10291,7 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
             env->enable_legacy_vendor_cache = true;
         }
 
-        if (IS_AMD_CPU(env)) {
+        if (IS_AMD_OR_HYGON_CPU(env)) {
             env->cache_info = legacy_amd_cache_info;
         } else {
             env->cache_info = legacy_intel_cache_info;

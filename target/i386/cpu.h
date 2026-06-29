@@ -1270,6 +1270,11 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define CPUID_VENDOR_AMD_3   0x444d4163 /* "cAMD" */
 #define CPUID_VENDOR_AMD   "AuthenticAMD"
 
+#define CPUID_VENDOR_HYGON_1 0x6f677948 /* "Hygo" */
+#define CPUID_VENDOR_HYGON_2 0x6e65476e /* "nGen" */
+#define CPUID_VENDOR_HYGON_3 0x656e6975 /* "uine" */
+#define CPUID_VENDOR_HYGON   "HygonGenuine"
+
 #define CPUID_VENDOR_ZHAOXIN1_1 0x746E6543 /* "Cent" */
 #define CPUID_VENDOR_ZHAOXIN1_2 0x48727561 /* "aurH" */
 #define CPUID_VENDOR_ZHAOXIN1_3 0x736C7561 /* "auls" */
@@ -1281,14 +1286,16 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define CPUID_VENDOR_ZHAOXIN1   "CentaurHauls"
 #define CPUID_VENDOR_ZHAOXIN2   "  Shanghai  "
 
-#define CPUID_VENDOR_HYGON    "HygonGenuine"
-
 #define IS_INTEL_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1 && \
                            (env)->cpuid_vendor2 == CPUID_VENDOR_INTEL_2 && \
                            (env)->cpuid_vendor3 == CPUID_VENDOR_INTEL_3)
+#define IS_HYGON_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_HYGON_1 && \
+                           (env)->cpuid_vendor2 == CPUID_VENDOR_HYGON_2 && \
+                           (env)->cpuid_vendor3 == CPUID_VENDOR_HYGON_3)
 #define IS_AMD_CPU(env) ((env)->cpuid_vendor1 == CPUID_VENDOR_AMD_1 && \
                          (env)->cpuid_vendor2 == CPUID_VENDOR_AMD_2 && \
                          (env)->cpuid_vendor3 == CPUID_VENDOR_AMD_3)
+#define IS_AMD_OR_HYGON_CPU(env) (IS_AMD_CPU(env) || IS_HYGON_CPU(env))
 #define IS_ZHAOXIN1_CPU(env) \
     ((env)->cpuid_vendor1 == CPUID_VENDOR_ZHAOXIN1_1 && \
      (env)->cpuid_vendor2 == CPUID_VENDOR_ZHAOXIN1_2 && \
