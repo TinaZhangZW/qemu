@@ -532,6 +532,11 @@ static const FeatureTestArgs feature_tests[] = {
         "Dhyana", "x-hygon-dhyana-amd-compat=off",
         0x80000001, 0, "EDX", 23, false,
     },
+    {
+        "x86/cpuid/features/dhyana/pmu-on/no-perfctr-core",
+        "Dhyana", "pmu=on",
+        0x80000001, 0, "ECX", 23, false,
+    },
 };
 
 static const FeatureFilterTestArgs feature_filter_tests[] = {

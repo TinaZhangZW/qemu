@@ -2175,6 +2175,22 @@ static void kvm_init_pmu_info_amd(struct kvm_cpuid2 *cpuid, X86CPU *cpu)
     }
 }
 
+/*
+ * Linux initializes Hygon CPUs through the AMD PMU driver.  Keep this helper
+ * limited to KVM's AMD PMU CPUID/MSR layout; it is not a general AMD/Hygon
+ * compatibility predicate.
+ */
+static bool kvm_pmu_uses_amd_msrs(CPUX86State *env)
+{
+    return IS_AMD_CPU(env) || IS_HYGON_CPU(env);
+}
+
+static bool host_cpu_uses_amd_pmu_msrs(const char *host_vendor)
+{
+    return g_str_equal(host_vendor, CPUID_VENDOR_AMD) ||
+           g_str_equal(host_vendor, CPUID_VENDOR_HYGON);
+}
+
 static bool is_host_compat_vendor(CPUX86State *env)
 {
     char host_vendor[CPUID_VENDOR_SZ + 1];
@@ -2191,8 +2207,8 @@ static bool is_host_compat_vendor(CPUX86State *env)
         return true;
     }
 
-    return g_str_equal(host_vendor, CPUID_VENDOR_AMD) &&
-           IS_AMD_CPU(env);
+    return host_cpu_uses_amd_pmu_msrs(host_vendor) &&
+           kvm_pmu_uses_amd_msrs(env);
 }
 
 static void kvm_init_pmu_info(struct kvm_cpuid2 *cpuid, X86CPU *cpu)
@@ -2222,7 +2238,7 @@ static void kvm_init_pmu_info(struct kvm_cpuid2 *cpuid, X86CPU *cpu)
 
     if (IS_INTEL_CPU(env) || IS_ZHAOXIN_CPU(env)) {
         kvm_init_pmu_info_intel(cpuid);
-    } else if (IS_AMD_CPU(env)) {
+    } else if (kvm_pmu_uses_amd_msrs(env)) {
         kvm_init_pmu_info_amd(cpuid, cpu);
     }
 }
@@ -4309,7 +4325,7 @@ static int kvm_put_msrs(X86CPU *cpu, KvmPutState level)
             }
         }
 
-        if (IS_AMD_CPU(env) && pmu_version > 0) {
+        if (kvm_pmu_uses_amd_msrs(env) && pmu_version > 0) {
             uint32_t sel_base = MSR_K7_EVNTSEL0;
             uint32_t ctr_base = MSR_K7_PERFCTR0;
             /*
@@ -4871,7 +4887,7 @@ static int kvm_get_msrs(X86CPU *cpu)
         }
     }
 
-    if (IS_AMD_CPU(env) && pmu_version > 0) {
+    if (kvm_pmu_uses_amd_msrs(env) && pmu_version > 0) {
         uint32_t sel_base = MSR_K7_EVNTSEL0;
         uint32_t ctr_base = MSR_K7_PERFCTR0;
         /*
