@@ -111,6 +111,8 @@ typedef struct FeatureTestArgs {
     int bitnr;
     /* The expected value for the bit in (X86CPUFeatureWordInfo.features) */
     bool expected_value;
+    /* machine type (may be NULL to use default machine) */
+    const char *machine;
 } FeatureTestArgs;
 
 typedef struct FeatureFilterTestArgs {
@@ -187,10 +189,19 @@ static void test_feature_flag(const void *data)
     QList *present, *filtered;
     uint32_t value;
 
+    cmdline = g_strdup_printf("-cpu %s", args->cpu);
+
     if (args->cpufeat) {
-        cmdline = g_strdup_printf("-cpu %s,%s", args->cpu, args->cpufeat);
-    } else {
-        cmdline = g_strdup_printf("-cpu %s", args->cpu);
+        char *save = cmdline;
+
+        cmdline = g_strdup_printf("%s,%s", cmdline, args->cpufeat);
+        g_free(save);
+    }
+    if (args->machine) {
+        char *save = cmdline;
+
+        cmdline = g_strdup_printf("-machine %s %s", args->machine, cmdline);
+        g_free(save);
     }
 
     qtest_start(cmdline);
@@ -537,6 +548,17 @@ static const FeatureTestArgs feature_tests[] = {
         "Dhyana", "pmu=on",
         0x80000001, 0, "ECX", 23, false,
     },
+    {
+        "x86/cpuid/features/dhyana/succor",
+        "Dhyana", NULL,
+        0x80000007, 0, "EBX", 1, true,
+    },
+    {
+        "x86/cpuid/features/dhyana/succor/pc-i440fx-11.0",
+        "Dhyana", NULL,
+        0x80000007, 0, "EBX", 1, false,
+        .machine = "pc-i440fx-11.0",
+    },
 };
 
 static const FeatureFilterTestArgs feature_filter_tests[] = {
@@ -544,6 +566,11 @@ static const FeatureFilterTestArgs feature_filter_tests[] = {
         "x86/cpuid/features/dhyana/arch-capabilities/filtered",
         "Dhyana", "arch-capabilities=on", NULL,
         7, 0, "EDX", 29, false, true,
+    },
+    {
+        "x86/cpuid/features/dhyana/succor/not-filtered",
+        "Dhyana", NULL, NULL,
+        0x80000007, 0, "EBX", 1, true, false,
     },
 };
 

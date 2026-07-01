@@ -75,6 +75,7 @@
 
 GlobalProperty pc_compat_11_0[] = {
     { TYPE_X86_CPU, "x-hygon-dhyana-amd-compat", "false" },
+    { "Dhyana" "-" TYPE_X86_CPU, "succor", "false" },
 };
 const size_t pc_compat_11_0_len = G_N_ELEMENTS(pc_compat_11_0);
 

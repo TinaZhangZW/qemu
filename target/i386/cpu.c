@@ -1407,7 +1407,7 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             NULL, NULL, NULL, NULL,
         },
         .cpuid = { .eax = 0x80000007, .reg = R_EBX, },
-        .tcg_features = 0,
+        .tcg_features = CPUID_8000_0007_EBX_SUCCOR,
         .unmigratable_flags = 0,
     },
     [FEAT_8000_0008_EBX] = {
@@ -6727,6 +6727,8 @@ static const X86CPUDefinition builtin_x86_defs[] = {
             CPUID_EXT3_MISALIGNSSE | CPUID_EXT3_SSE4A | CPUID_EXT3_ABM |
             CPUID_EXT3_CR8LEG | CPUID_EXT3_SVM | CPUID_EXT3_LAHF_LM |
             CPUID_EXT3_TOPOEXT,
+        .features[FEAT_8000_0007_EBX] =
+            CPUID_8000_0007_EBX_SUCCOR,
         .features[FEAT_8000_0008_EBX] =
             CPUID_8000_0008_EBX_IBPB,
         .features[FEAT_7_0_EBX] =
@@ -8266,8 +8268,8 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
 #endif
 
     case FEAT_8000_0007_EBX:
-        if (cpu && !IS_AMD_CPU(&cpu->env)) {
-            /* Disable AMD machine check architecture for Intel CPU.  */
+        if (cpu && !IS_AMD_CPU(&cpu->env) && !IS_HYGON_CPU(&cpu->env)) {
+            /* Disable AMD/Hygon machine check architecture for other CPUs. */
             unavail = ~0;
         }
         break;
