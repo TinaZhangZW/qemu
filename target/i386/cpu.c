@@ -10244,7 +10244,13 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
          * needs to happen after the evenual setting of ucode_rev in
          * accel-specific code in cpu_exec_realizefn.
          */
-        if (IS_AMD_CPU(env)) {
+        /*
+         * Linux reads Hygon's MSR 0x8b as MSR_AMD64_PATCH_LEVEL, like AMD,
+         * so use the low-32-bit KVM-SVM shaped default unless compatibility
+         * requires the old Intel/KVM-VMX shaped value.
+         */
+        if (IS_AMD_CPU(env) ||
+            (IS_HYGON_CPU(env) && cpu->hygon_dhyana_amd_compat)) {
             cpu->ucode_rev = 0x01000065;
         } else {
             cpu->ucode_rev = 0x100000000ULL;
