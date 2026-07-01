@@ -113,6 +113,45 @@ typedef struct FeatureTestArgs {
     bool expected_value;
 } FeatureTestArgs;
 
+typedef struct FeatureFilterTestArgs {
+    /* Test name */
+    const char *name;
+    /* CPU type */
+    const char *cpu;
+    /* CPU features, may be NULL */
+    const char *cpufeat;
+    /* machine type (may be NULL to use default machine) */
+    const char *machine;
+    /*
+     * cpuid-input-eax and cpuid-input-ecx values to look for,
+     * in "feature-words" and "filtered-features" properties.
+     */
+    uint32_t in_eax, in_ecx;
+    /* The register name to look for, in the X86CPUFeatureWordInfo array */
+    const char *reg;
+    /* The bit to check in X86CPUFeatureWordInfo.features */
+    int bitnr;
+    /* Expected value for the bit in "feature-words" */
+    bool expected_present;
+    /* Expected value for the bit in "filtered-features" */
+    bool expected_filtered;
+} FeatureFilterTestArgs;
+
+typedef struct BoolPropTestArgs {
+    /* Test name */
+    const char *name;
+    /* CPU type */
+    const char *cpu;
+    /* CPU features (may be NULL) */
+    const char *cpufeat;
+    /* machine type (may be NULL to use default machine) */
+    const char *machine;
+    /* CPU property to read */
+    const char *property;
+    /* expected value of the property */
+    bool expected_value;
+} BoolPropTestArgs;
+
 /* Get the value for a feature word in a X86CPUFeatureWordInfo list */
 static uint32_t get_feature_word(QList *features, uint32_t eax, uint32_t ecx,
                                  const char *reg)
@@ -166,6 +205,82 @@ static void test_feature_flag(const void *data)
 
     qobject_unref(present);
     qobject_unref(filtered);
+    g_free(path);
+    g_free(cmdline);
+}
+
+static void test_feature_filter_flag(const void *data)
+{
+    const FeatureFilterTestArgs *args = data;
+    char *path;
+    char *cmdline;
+    QList *present, *filtered;
+    uint32_t present_value, filtered_value;
+
+    cmdline = g_strdup_printf("-cpu %s", args->cpu);
+
+    if (args->cpufeat) {
+        char *save = cmdline;
+
+        cmdline = g_strdup_printf("%s,%s", cmdline, args->cpufeat);
+        g_free(save);
+    }
+    if (args->machine) {
+        char *save = cmdline;
+
+        cmdline = g_strdup_printf("-machine %s %s", args->machine, cmdline);
+        g_free(save);
+    }
+
+    qtest_start(cmdline);
+    path = get_cpu0_qom_path();
+    present = qobject_to(QList, qom_get(path, "feature-words"));
+    filtered = qobject_to(QList, qom_get(path, "filtered-features"));
+    present_value = get_feature_word(present, args->in_eax, args->in_ecx,
+                                     args->reg);
+    filtered_value = get_feature_word(filtered, args->in_eax, args->in_ecx,
+                                      args->reg);
+    qtest_end();
+
+    g_assert(!!(present_value & (1U << args->bitnr)) ==
+             args->expected_present);
+    g_assert(!!(filtered_value & (1U << args->bitnr)) ==
+             args->expected_filtered);
+
+    qobject_unref(present);
+    qobject_unref(filtered);
+    g_free(path);
+    g_free(cmdline);
+}
+
+static void test_bool_prop(const void *data)
+{
+    const BoolPropTestArgs *args = data;
+    char *cmdline;
+    char *save;
+    char *path;
+    bool value;
+
+    cmdline = g_strdup_printf("-cpu %s", args->cpu);
+
+    if (args->cpufeat) {
+        save = cmdline;
+        cmdline = g_strdup_printf("%s,%s", cmdline, args->cpufeat);
+        g_free(save);
+    }
+    if (args->machine) {
+        save = cmdline;
+        cmdline = g_strdup_printf("-machine %s %s", args->machine, cmdline);
+        g_free(save);
+    }
+
+    qtest_start(cmdline);
+    path = get_cpu0_qom_path();
+    value = qom_get_bool(path, args->property);
+    qtest_end();
+
+    g_assert_cmpint(value, ==, args->expected_value);
+
     g_free(path);
     g_free(cmdline);
 }
@@ -419,6 +534,26 @@ static const FeatureTestArgs feature_tests[] = {
     },
 };
 
+static const FeatureFilterTestArgs feature_filter_tests[] = {
+    {
+        "x86/cpuid/features/dhyana/arch-capabilities/filtered",
+        "Dhyana", "arch-capabilities=on", NULL,
+        7, 0, "EDX", 29, false, true,
+    },
+};
+
+static const BoolPropTestArgs bool_prop_tests[] = {
+    {
+        "x86/cpuid/props/dhyana/hygon-dhyana-amd-compat/default",
+        "Dhyana", NULL, NULL, "x-hygon-dhyana-amd-compat", true,
+    },
+    {
+        "x86/cpuid/props/dhyana/hygon-dhyana-amd-compat/pc-i440fx-11.0",
+        "Dhyana", NULL, "pc-i440fx-11.0",
+        "x-hygon-dhyana-amd-compat", false,
+    },
+};
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -442,6 +577,21 @@ int main(int argc, char **argv)
         }
         qtest_add_data_func(feature_tests[i].name,
                             &feature_tests[i], test_feature_flag);
+    }
+    for (int i = 0; i < ARRAY_SIZE(feature_filter_tests); i++) {
+        if (!qtest_has_cpu_model(feature_filter_tests[i].cpu)) {
+            continue;
+        }
+        qtest_add_data_func(feature_filter_tests[i].name,
+                            &feature_filter_tests[i],
+                            test_feature_filter_flag);
+    }
+    for (int i = 0; i < ARRAY_SIZE(bool_prop_tests); i++) {
+        if (!qtest_has_cpu_model(bool_prop_tests[i].cpu)) {
+            continue;
+        }
+        qtest_add_data_func(bool_prop_tests[i].name,
+                            &bool_prop_tests[i], test_bool_prop);
     }
 
     return g_test_run();

@@ -8208,6 +8208,8 @@ static uint8_t x86_cpu_get_host_avx10_version(void)
     return ebx & 0xff;
 }
 
+static bool x86_cpu_should_hide_arch_capabilities(const X86CPU *cpu);
+
 uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
 {
     FeatureWordInfo *wi = &feature_word_info[w];
@@ -8290,11 +8292,13 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
          * Windows does not like ARCH_CAPABILITIES on AMD machines at all.
          * Do not show the fake ARCH_CAPABILITIES MSR that KVM sets up,
          * except if needed for migration.
+         * The same Intel-defined MSR path is hidden for Hygon Dhyana unless
+         * an old machine type asks to preserve the previous ABI.
          *
          * When arch_cap_always_on is removed, this tweak can move to
          * kvm_arch_get_supported_cpuid.
          */
-        if (cpu && IS_AMD_CPU(&cpu->env) && !cpu->arch_cap_always_on) {
+        if (cpu && x86_cpu_should_hide_arch_capabilities(cpu)) {
             unavail = CPUID_7_0_EDX_ARCH_CAPABILITIES;
         }
         break;
@@ -8598,6 +8602,27 @@ uint32_t cpu_x86_virtual_addr_width(CPUX86State *env)
     } else {
         return 48; /* 48 bits virtual */
     }
+}
+
+/*
+ * IA32_ARCH_CAPABILITIES is an Intel-defined MSR.  KVM can synthesize it
+ * for AMD-compatible guests, but Windows may not expect it on non-Intel
+ * CPUs.  Keep this limited to the architectural MSR/CPUID enumeration path.
+ */
+static bool x86_cpu_should_hide_arch_capabilities(const X86CPU *cpu)
+{
+    const CPUX86State *env = &cpu->env;
+
+    if (cpu->arch_cap_always_on) {
+        return false;
+    }
+    if (IS_AMD_CPU(env)) {
+        return true;
+    }
+    if (IS_HYGON_CPU(env) && cpu->hygon_dhyana_amd_compat) {
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -9963,6 +9988,14 @@ static bool x86_cpu_filter_features(X86CPU *cpu, bool verbose)
              */
             mark_unavailable_features(cpu, FEAT_7_0_EBX, CPUID_7_0_EBX_INTEL_PT, prefix);
         }
+    }
+
+    if (x86_cpu_should_hide_arch_capabilities(cpu)) {
+        mark_unavailable_features(cpu, FEAT_7_0_EDX,
+                                  CPUID_7_0_EDX_ARCH_CAPABILITIES, prefix);
+        mark_unavailable_features(cpu, FEAT_ARCH_CAPABILITIES,
+                                  env->features[FEAT_ARCH_CAPABILITIES],
+                                  prefix);
     }
 
     have_filtered_features = x86_cpu_have_filtered_features(cpu);
